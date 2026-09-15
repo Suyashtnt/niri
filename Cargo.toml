@@ -1,31 +1,40 @@
 [workspace]
-members = ["niri-visual-tests"]
+members = [
+    "niri-config",
+    "niri-ipc",
+    "niri-visual-tests",
+]
 
 [workspace.package]
-version = "0.1.7"
+version = "26.4.0"
 description = "A scrollable-tiling Wayland compositor"
 authors = ["Ivan Molodetskikh <yalterz@gmail.com>"]
 license = "GPL-3.0-or-later"
 edition = "2021"
-repository = "https://github.com/YaLTeR/niri"
+repository = "https://github.com/niri-wm/niri"
+rust-version = "1.87"
 
 [workspace.dependencies]
-anyhow = "1.0.86"
-bitflags = "2.6.0"
-clap = { version = "~4.4.18", features = ["derive"] }
-serde = { version = "1.0.204", features = ["derive"] }
-serde_json = "1.0.120"
-tracing = { version = "0.1.40", features = ["max_level_trace", "release_max_level_debug"] }
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-tracy-client = { version = "0.17.1", default-features = false }
+anyhow = "1.0.104"
+bitflags = "2.13"
+clap = { version = "4.6.6", features = ["derive"] }
+insta = "1.48.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tracing = { version = "0.1.44", features = ["max_level_trace", "release_max_level_debug"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracy-client = { version = "0.18.5", default-features = false }
 
 [workspace.dependencies.smithay]
+# version = "0.4.1"
 git = "https://github.com/Smithay/smithay.git"
-# path = "../smithay"
+rev = "22571baa20d34d71092942dbb520c4e3fbbd6263"
 default-features = false
 
 [workspace.dependencies.smithay-drm-extras]
+# version = "0.1.0"
 git = "https://github.com/Smithay/smithay.git"
+rev = "22571baa20d34d71092942dbb520c4e3fbbd6263"
 # path = "../smithay/smithay-drm-extras"
 
 [package]
@@ -36,50 +45,57 @@ authors.workspace = true
 license.workspace = true
 edition.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 
 readme = "README.md"
 keywords = ["wayland", "compositor", "tiling", "smithay", "wm"]
 
 [dependencies]
+accesskit = { version = "0.25", optional = true }
+accesskit_unix = { version = "0.23", optional = true }
 anyhow.workspace = true
-arrayvec = "0.7.4"
-async-channel = "2.3.1"
-async-io = { version = "1.13.0", optional = true }
-atomic = "0.6.0"
+arrayvec = "0.7.8"
+async-channel = "2.5.0"
+async-io = { version = "2.6.0", optional = true }
+atomic = "0.6.1"
 bitflags.workspace = true
-bytemuck = { version = "1.16.1", features = ["derive"] }
-calloop = { version = "0.14.0", features = ["executor", "futures-io"] }
+bytemuck = { version = "1.25.2", features = ["derive"] }
+calloop = { version = "0.14.4", features = ["executor", "futures-io", "signals"] }
 clap = { workspace = true, features = ["string"] }
-directories = "5.0.1"
-drm-ffi = "0.8.0"
-fastrand = "2.1.0"
-futures-util = { version = "0.3.30", default-features = false, features = ["std", "io"] }
+clap_complete = "4.6"
+clap_complete_nushell = "4.6"
+directories = "6.0.0"
+drm-ffi = "0.9.1"
+fastrand = "2.5.0"
+futures-util = { version = "0.3", default-features = false, features = ["std", "io"] }
 git-version = "0.3.9"
-glam = "0.28.0"
-input = { version = "0.9.0", features = ["libinput_1_21"] }
+glam = "0.33"
+input = { version = "0.10.0", features = ["libinput_1_21"] }
 keyframe = { version = "1.1.1", default-features = false }
-libc = "0.2.155"
-log = { version = "0.4.22", features = ["max_level_trace", "release_max_level_debug"] }
-niri-config = { version = "0.1.7", path = "niri-config" }
-niri-ipc = { version = "0.1.7", path = "niri-ipc", features = ["clap"] }
-notify-rust = { version = "~4.10.0", optional = true }
-ordered-float = "4.2.1"
-pango = { version = "0.20.0", features = ["v1_44"] }
-pangocairo = "0.20.0"
-pipewire = { version = "0.8.0", optional = true }
-png = "0.17.13"
-portable-atomic = { version = "1.7.0", default-features = false, features = ["float"] }
-profiling = "1.0.15"
-sd-notify = "0.4.2"
+libc = "0.2.189"
+libdisplay-info = "0.3.0"
+log = { version = "0.4", features = ["max_level_trace", "release_max_level_debug"] }
+niri-config = { version = "26.4.0", path = "niri-config" }
+niri-ipc = { version = "26.4.0", path = "niri-ipc", features = ["clap"] }
+ordered-float = "5"
+pango = { version = "0.21.5", features = ["v1_44"] }
+pangocairo = "0.21.5"
+pipewire = { version = "0.10", optional = true, features = ["v0_3_33"] }
+png = "0.18.1"
+portable-atomic = "1"
+profiling = "1.0.18"
+sd-notify = "0.5.0"
 serde.workspace = true
 serde_json.workspace = true
 smithay-drm-extras.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
 tracy-client.workspace = true
-url = { version = "2.5.2", optional = true }
-xcursor = "0.3.6"
-zbus = { version = "~3.15.2", optional = true }
+wayland-backend = "0.3"
+wayland-scanner = "0.31.11"
+wayland-server = "0.31.14"
+xcursor = "0.3.11"
+zbus = { version = "5", optional = true }
 
 [dependencies.smithay]
 workspace = true
@@ -101,25 +117,37 @@ features = [
 
 [dev-dependencies]
 approx = "0.5.1"
-k9 = "0.12.0"
-proptest = "1.5.0"
-proptest-derive = "0.5.0"
-xshell = "0.2.6"
+calloop-wayland-source = "0.4.1"
+insta.workspace = true
+proptest = "1.11.0"
+proptest-derive = { version = "0.8.0", features = ["boxed_union"] }
+rayon = "1.12.0"
+wayland-client = "0.31.15"
+xshell = "0.2.7"
+
+[build-dependencies]
+pkg-config = "0.3"
 
 [features]
 default = ["dbus", "systemd", "xdp-gnome-screencast"]
-# Enables D-Bus support (serve various freedesktop and GNOME interfaces, power button handling).
-dbus = ["zbus", "async-io", "notify-rust", "url"]
+# Enables D-Bus support (serve various freedesktop and GNOME interfaces, accessibility tree, power button handling).
+dbus = ["dep:zbus", "dep:async-io", "dep:accesskit", "dep:accesskit_unix"]
 # Enables systemd integration (global environment, apps in transient scopes).
 systemd = ["dbus"]
 # Enables screencasting support through xdg-desktop-portal-gnome.
 xdp-gnome-screencast = ["dbus", "pipewire"]
 # Enables the Tracy profiler instrumentation.
-profile-with-tracy = ["profiling/profile-with-tracy", "tracy-client/default"]
+profile-with-tracy = ["profiling/profile-with-tracy", "tracy-client/default", "smithay/tracy_gpu_profiling"]
 # Enables the on-demand Tracy profiler instrumentation.
 profile-with-tracy-ondemand = ["profile-with-tracy", "tracy-client/ondemand", "tracy-client/manual-lifetime"]
+# Enables Tracy allocation profiling.
+profile-with-tracy-allocations = ["profile-with-tracy"]
 # Enables dinit integration (global environment).
 dinit = []
+
+[lints.clippy]
+new_without_default = "allow"
+collapsible_match = "allow"
 
 [profile.release]
 debug = "line-tables-only"
@@ -130,8 +158,12 @@ lto = "thin"
 # knuffel with chomsky generates a metric ton of debuginfo.
 debug = false
 
+[profile.dev.package]
+insta.opt-level = 3
+similar.opt-level = 3
+
 [package.metadata.generate-rpm]
-version = "0.1.7"
+version = "26.04"
 assets = [
     { source = "target/release/niri", dest = "/usr/bin/", mode = "755" },
     { source = "resources/niri-session", dest = "/usr/bin/", mode = "755" },

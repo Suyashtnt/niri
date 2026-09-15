@@ -1,8 +1,7 @@
 use std::iter::zip;
 
-use arrayvec::ArrayVec;
-use niri_config::{CornerRadius, Gradient, GradientInterpolation, GradientRelativeTo};
-use smithay::backend::renderer::element::Kind;
+use niri_config::{CornerRadius, Gradient, GradientRelativeTo};
+use smithay::backend::renderer::element::{Element as _, Kind};
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use crate::niri_render_elements;
@@ -20,6 +19,7 @@ pub struct FocusRing {
     is_border: bool,
     use_border_shader: bool,
     config: niri_config::FocusRing,
+    thicken_corners: bool,
 }
 
 niri_render_elements! {
@@ -40,6 +40,7 @@ impl FocusRing {
             is_border: false,
             use_border_shader: false,
             config,
+            thicken_corners: true,
         }
     }
 
@@ -53,31 +54,39 @@ impl FocusRing {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_render_elements(
         &mut self,
         win_size: Size<f64, Logical>,
         is_active: bool,
         is_border: bool,
+        is_urgent: bool,
         view_rect: Rectangle<f64, Logical>,
         radius: CornerRadius,
         scale: f64,
+        alpha: f32,
     ) {
-        let width = self.config.width.0;
+        let width = self.config.width;
         self.full_size = win_size + Size::from((width, width)).upscale(2.);
+        self.is_border = is_border;
 
-        let color = if is_active {
+        let color = if is_urgent {
+            self.config.urgent_color
+        } else if is_active {
             self.config.active_color
         } else {
             self.config.inactive_color
         };
 
         for buf in &mut self.buffers {
-            buf.set_color(color.to_array_premul());
+            buf.set_color(color);
         }
 
         let radius = radius.fit_to(self.full_size.w as f32, self.full_size.h as f32);
 
-        let gradient = if is_active {
+        let gradient = if is_urgent {
+            self.config.urgent_gradient
+        } else if is_active {
             self.config.active_gradient
         } else {
             self.config.inactive_gradient
@@ -86,24 +95,19 @@ impl FocusRing {
         self.use_border_shader = radius != CornerRadius::default() || gradient.is_some();
 
         // Set the defaults for solid color + rounded corners.
-        let gradient = gradient.unwrap_or(Gradient {
-            from: color,
-            to: color,
-            angle: 0,
-            relative_to: GradientRelativeTo::Window,
-            in_: GradientInterpolation::default(),
-        });
+        let gradient = gradient.unwrap_or_else(|| Gradient::from(color));
 
-        let full_rect = Rectangle::from_loc_and_size((-width, -width), self.full_size);
+        let full_rect = Rectangle::new(Point::from((-width, -width)), self.full_size);
         let gradient_area = match gradient.relative_to {
             GradientRelativeTo::Window => full_rect,
             GradientRelativeTo::WorkspaceView => view_rect,
         };
 
-        let rounded_corner_border_width = if self.is_border {
+        let rounded_corner_border_width = if is_border {
             // HACK: increase the border width used for the inner rounded corners a tiny bit to
             // reduce background bleed.
-            width as f32 + 0.5
+            let extra = if self.thicken_corners { 0.5 } else { 0. };
+            width as f32 + extra
         } else {
             0.
         };
@@ -178,15 +182,16 @@ impl FocusRing {
             for (border, (loc, size)) in zip(&mut self.borders, zip(self.locations, self.sizes)) {
                 border.update(
                     size,
-                    Rectangle::from_loc_and_size(gradient_area.loc - loc, gradient_area.size),
+                    Rectangle::new(gradient_area.loc - loc, gradient_area.size),
                     gradient.in_,
                     gradient.from,
                     gradient.to,
                     ((gradient.angle as f32) - 90.).to_radians(),
-                    Rectangle::from_loc_and_size(full_rect.loc - loc, full_rect.size),
+                    Rectangle::new(full_rect.loc - loc, full_rect.size),
                     rounded_corner_border_width,
                     radius,
                     scale as f32,
+                    alpha,
                 );
             }
         } else {
@@ -196,40 +201,35 @@ impl FocusRing {
 
             self.borders[0].update(
                 self.sizes[0],
-                Rectangle::from_loc_and_size(
-                    gradient_area.loc - self.locations[0],
-                    gradient_area.size,
-                ),
+                Rectangle::new(gradient_area.loc - self.locations[0], gradient_area.size),
                 gradient.in_,
                 gradient.from,
                 gradient.to,
                 ((gradient.angle as f32) - 90.).to_radians(),
-                Rectangle::from_loc_and_size(full_rect.loc - self.locations[0], full_rect.size),
+                Rectangle::new(full_rect.loc - self.locations[0], full_rect.size),
                 rounded_corner_border_width,
                 radius,
                 scale as f32,
+                alpha,
             );
         }
-
-        self.is_border = is_border;
     }
 
     pub fn render(
         &self,
         renderer: &mut impl NiriRenderer,
         location: Point<f64, Logical>,
-    ) -> impl Iterator<Item = FocusRingRenderElement> {
-        let mut rv = ArrayVec::<_, 8>::new();
-
+        push: &mut dyn FnMut(FocusRingRenderElement),
+    ) {
         if self.config.off {
-            return rv.into_iter();
+            return;
         }
 
         let border_width = -self.locations[0].y;
 
         // If drawing as a border with width = 0, then there's nothing to draw.
         if self.is_border && border_width == 0. {
-            return rv.into_iter();
+            return;
         }
 
         let has_border_shader = BorderRenderElement::has_shader(renderer);
@@ -238,9 +238,11 @@ impl FocusRing {
             let elem = if self.use_border_shader && has_border_shader {
                 border.clone().with_location(location).into()
             } else {
-                SolidColorRenderElement::from_buffer(buffer, location, 1., Kind::Unspecified).into()
+                let alpha = border.alpha();
+                SolidColorRenderElement::from_buffer(buffer, location, alpha, Kind::Unspecified)
+                    .into()
             };
-            rv.push(elem);
+            push(elem);
         };
 
         if self.is_border {
@@ -254,15 +256,21 @@ impl FocusRing {
                 location + self.locations[0],
             );
         }
-
-        rv.into_iter()
     }
 
     pub fn width(&self) -> f64 {
-        self.config.width.0
+        self.config.width
     }
 
     pub fn is_off(&self) -> bool {
         self.config.off
+    }
+
+    pub fn set_thicken_corners(&mut self, value: bool) {
+        self.thicken_corners = value;
+    }
+
+    pub fn config(&self) -> &niri_config::FocusRing {
+        &self.config
     }
 }

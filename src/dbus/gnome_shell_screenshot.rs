@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-use zbus::dbus_interface;
-use zbus::fdo::{self, RequestNameFlags};
+use niri_ipc::PickedColor;
+use zbus::zvariant::OwnedValue;
+use zbus::{fdo, interface, zvariant};
 
-use super::Start;
+use super::{request_name, Start};
 
 pub struct Screenshot {
     to_niri: calloop::channel::Sender<ScreenshotToNiri>,
@@ -12,13 +14,14 @@ pub struct Screenshot {
 
 pub enum ScreenshotToNiri {
     TakeScreenshot { include_cursor: bool },
+    PickColor(async_channel::Sender<Option<PickedColor>>),
 }
 
 pub enum NiriToScreenshot {
     ScreenshotResult(Option<PathBuf>),
 }
 
-#[dbus_interface(name = "org.gnome.Shell.Screenshot")]
+#[interface(name = "org.gnome.Shell.Screenshot")]
 impl Screenshot {
     async fn screenshot(
         &self,
@@ -47,6 +50,34 @@ impl Screenshot {
 
         Ok((true, filename))
     }
+
+    async fn pick_color(&self) -> fdo::Result<HashMap<String, OwnedValue>> {
+        let (tx, rx) = async_channel::bounded(1);
+        if let Err(err) = self.to_niri.send(ScreenshotToNiri::PickColor(tx)) {
+            warn!("error sending pick color message to niri: {err:?}");
+            return Err(fdo::Error::Failed("internal error".to_owned()));
+        }
+
+        let color = match rx.recv().await {
+            Ok(Some(color)) => color,
+            Ok(None) => {
+                return Err(fdo::Error::Failed("no color picked".to_owned()));
+            }
+            Err(err) => {
+                warn!("error receiving message from niri: {err:?}");
+                return Err(fdo::Error::Failed("internal error".to_owned()));
+            }
+        };
+
+        let mut result = HashMap::new();
+        let [r, g, b] = color.rgb;
+        result.insert(
+            "color".to_string(),
+            zvariant::OwnedValue::try_from(zvariant::Value::from((r, g, b))).unwrap(),
+        );
+
+        Ok(result)
+    }
 }
 
 impl Screenshot {
@@ -59,15 +90,11 @@ impl Screenshot {
 }
 
 impl Start for Screenshot {
-    fn start(self) -> anyhow::Result<zbus::blocking::Connection> {
+    fn start(self, monitor: bool) -> anyhow::Result<zbus::blocking::Connection> {
         let conn = zbus::blocking::Connection::session()?;
-        let flags = RequestNameFlags::AllowReplacement
-            | RequestNameFlags::ReplaceExisting
-            | RequestNameFlags::DoNotQueue;
-
         conn.object_server()
             .at("/org/gnome/Shell/Screenshot", self)?;
-        conn.request_name_with_flags("org.gnome.Shell.Screenshot", flags)?;
+        request_name(&conn, "org.gnome.Shell.Screenshot", monitor)?;
 
         Ok(conn)
     }

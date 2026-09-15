@@ -14,15 +14,12 @@ use smithay::output::Output;
 use smithay::reexports::gbm::Format as Fourcc;
 use smithay::utils::{Point, Transform};
 
-use crate::animation::Animation;
+use crate::animation::{Animation, Clock};
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::utils::{output_size, to_physical_precise_round};
 
-const TEXT: &str = "Failed to parse the config file. \
-                    Please run <span face='monospace' bgcolor='#000000'>niri validate</span> \
-                    to see the errors.";
 const PADDING: i32 = 8;
 const FONT: &str = "sans 14px";
 const BORDER: i32 = 4;
@@ -35,6 +32,7 @@ pub struct ConfigErrorNotification {
     // notification.
     created_path: Option<PathBuf>,
 
+    clock: Clock,
     config: Rc<RefCell<Config>>,
 }
 
@@ -46,23 +44,30 @@ enum State {
 }
 
 impl ConfigErrorNotification {
-    pub fn new(config: Rc<RefCell<Config>>) -> Self {
+    pub fn new(clock: Clock, config: Rc<RefCell<Config>>) -> Self {
         Self {
             state: State::Hidden,
             buffers: RefCell::new(HashMap::new()),
             created_path: None,
+            clock,
             config,
         }
     }
 
     fn animation(&self, from: f64, to: f64) -> Animation {
         let c = self.config.borrow();
-        Animation::new(from, to, 0., c.animations.config_notification_open_close.0)
+        Animation::new(
+            self.clock.clone(),
+            from,
+            to,
+            0.,
+            c.animations.config_notification_open_close.0,
+        )
     }
 
-    pub fn show_created(&mut self, created_path: Option<PathBuf>) {
-        if self.created_path != created_path {
-            self.created_path = created_path;
+    pub fn show_created(&mut self, created_path: &Path) {
+        if self.created_path.as_deref() != Some(created_path) {
+            self.created_path = Some(created_path.to_owned());
             self.buffers.borrow_mut().clear();
         }
 
@@ -70,6 +75,11 @@ impl ConfigErrorNotification {
     }
 
     pub fn show(&mut self) {
+        let c = self.config.borrow();
+        if c.config_notification.disable_failed {
+            return;
+        }
+
         if self.created_path.is_some() {
             self.created_path = None;
             self.buffers.borrow_mut().clear();
@@ -87,11 +97,10 @@ impl ConfigErrorNotification {
         self.state = State::Hiding(self.animation(1., 0.));
     }
 
-    pub fn advance_animations(&mut self, target_presentation_time: Duration) {
+    pub fn advance_animations(&mut self) {
         match &mut self.state {
             State::Hidden => (),
             State::Showing(anim) => {
-                anim.set_current_time(target_presentation_time);
                 if anim.is_done() {
                     let duration = if self.created_path.is_some() {
                         // Make this quite a bit longer because it comes with a monitor modeset
@@ -101,16 +110,15 @@ impl ConfigErrorNotification {
                     } else {
                         Duration::from_secs(4)
                     };
-                    self.state = State::Shown(target_presentation_time + duration);
+                    self.state = State::Shown(self.clock.now_unadjusted() + duration);
                 }
             }
             State::Shown(deadline) => {
-                if target_presentation_time >= *deadline {
+                if self.clock.now_unadjusted() >= *deadline {
                     self.hide();
                 }
             }
             State::Hiding(anim) => {
-                anim.set_current_time(target_presentation_time);
                 if anim.is_clamped_done() {
                     self.state = State::Hidden;
                 }
@@ -175,13 +183,12 @@ fn render(
 
     let padding: i32 = to_physical_precise_round(scale, PADDING);
 
-    let mut text = String::from(TEXT);
+    let mut text = error_text(true);
     let mut border_color = (1., 0.3, 0.3);
     if let Some(path) = created_path {
         text = format!(
             "Created a default config file at \
-             <span face='monospace' bgcolor='#000000'>{:?}</span>",
-            path
+             <span face='monospace' bgcolor='#000000'>{path:?}</span>",
         );
         border_color = (0.5, 1., 0.5);
     };
@@ -238,4 +245,14 @@ fn render(
     )?;
 
     Ok(buffer)
+}
+
+pub fn error_text(markup: bool) -> String {
+    let command = if markup {
+        "<span face='monospace' bgcolor='#000000'>niri validate</span>"
+    } else {
+        "niri validate"
+    };
+
+    format!("Failed to parse the config file. Please run {command} to see the errors.")
 }

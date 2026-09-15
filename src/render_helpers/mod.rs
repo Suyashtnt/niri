@@ -1,26 +1,40 @@
 use std::ptr;
 
-use anyhow::{ensure, Context};
+use anyhow::{bail, ensure, Context as _};
 use niri_config::BlockOutFrom;
-use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::{Buffer, Fourcc};
+use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
-use smithay::backend::renderer::element::{Kind, RenderElement};
-use smithay::backend::renderer::gles::{GlesMapping, GlesRenderer, GlesTexture};
+use smithay::backend::renderer::element::{Element, Kind, RenderElement, RenderElementStates};
+use smithay::backend::renderer::gles::{
+    GlesError, GlesMapping, GlesRenderer, GlesTarget, GlesTexture,
+};
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::{buffer_dimensions, Bind, ExportMem, Frame, Offscreen, Renderer};
+use smithay::backend::renderer::{
+    Bind, Color32F, ExportMem, Frame, Offscreen, Renderer, Texture as _,
+};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_shm;
+use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::shm;
 use solid_color::{SolidColorBuffer, SolidColorRenderElement};
 
 use self::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use self::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::renderer::AsGlesRenderer;
+use crate::render_helpers::xray::Xray;
 
+pub mod background_effect;
+pub mod blur;
 pub mod border;
 pub mod clipped_surface;
 pub mod damage;
 pub mod debug;
+pub mod effect_buffer;
+pub mod framebuffer_effect;
+pub mod gradient_fade_texture;
 pub mod memory;
 pub mod offscreen;
 pub mod primary_gpu_texture;
@@ -30,16 +44,49 @@ pub mod resize;
 pub mod resources;
 pub mod shader_element;
 pub mod shaders;
+pub mod shadow;
 pub mod snapshot;
 pub mod solid_color;
 pub mod surface;
 pub mod texture;
+pub mod xray;
+
+/// A rendering context.
+///
+/// Bundles together things needed by most rendering code.
+pub struct RenderCtx<'a, R> {
+    pub renderer: &'a mut R,
+    pub target: RenderTarget,
+    pub xray: Option<&'a Xray>,
+}
+
+impl<'a, R> RenderCtx<'a, R> {
+    /// Reborrows this context with a smaller lifetime.
+    #[inline]
+    pub fn r<'b>(&'b mut self) -> RenderCtx<'b, R> {
+        RenderCtx {
+            renderer: self.renderer,
+            target: self.target,
+            xray: self.xray,
+        }
+    }
+}
+
+impl<'a, R: AsGlesRenderer> RenderCtx<'a, R> {
+    pub fn as_gles<'b>(&'b mut self) -> RenderCtx<'b, GlesRenderer> {
+        RenderCtx {
+            renderer: self.renderer.as_gles_renderer(),
+            target: self.target,
+            xray: self.xray,
+        }
+    }
+}
 
 /// What we're rendering for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderTarget {
     /// Rendering to display on screen.
-    Output,
+    Output = 0,
     /// Rendering for a screencast.
     Screencast,
     /// Rendering for any other screen capture.
@@ -55,13 +102,6 @@ pub struct BakedBuffer<B> {
     pub dst: Option<Size<i32, Logical>>,
 }
 
-/// Render elements split into normal and popup.
-#[derive(Debug)]
-pub struct SplitElements<E> {
-    pub normal: Vec<E>,
-    pub popups: Vec<E>,
-}
-
 pub trait ToRenderElement {
     type RenderElement;
 
@@ -75,42 +115,14 @@ pub trait ToRenderElement {
 }
 
 impl RenderTarget {
+    pub const COUNT: usize = 3;
+
     pub fn should_block_out(self, block_out_from: Option<BlockOutFrom>) -> bool {
         match block_out_from {
             None => false,
             Some(BlockOutFrom::Screencast) => self == RenderTarget::Screencast,
             Some(BlockOutFrom::ScreenCapture) => self != RenderTarget::Output,
         }
-    }
-}
-
-impl<E> Default for SplitElements<E> {
-    fn default() -> Self {
-        Self {
-            normal: Vec::new(),
-            popups: Vec::new(),
-        }
-    }
-}
-
-impl<E> IntoIterator for SplitElements<E> {
-    type Item = E;
-    type IntoIter = std::iter::Chain<std::vec::IntoIter<E>, std::vec::IntoIter<E>>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.popups.into_iter().chain(self.normal)
-    }
-}
-
-impl<E> SplitElements<E> {
-    pub fn iter(&self) -> std::iter::Chain<std::slice::Iter<E>, std::slice::Iter<E>> {
-        self.popups.iter().chain(&self.normal)
-    }
-
-    pub fn into_vec(self) -> Vec<E> {
-        let Self { normal, mut popups } = self;
-        popups.extend(normal);
-        popups
     }
 }
 
@@ -150,6 +162,33 @@ impl ToRenderElement for BakedBuffer<SolidColorBuffer> {
     }
 }
 
+pub fn encompassing_geo(
+    scale: Scale<f64>,
+    elements: impl Iterator<Item = impl Element>,
+) -> Rectangle<i32, Physical> {
+    elements
+        .map(|ele| ele.geometry(scale))
+        .reduce(|a, b| a.merge(b))
+        .unwrap_or_default()
+}
+
+pub fn create_texture(
+    renderer: &mut GlesRenderer,
+    size: Size<i32, Physical>,
+    fourcc: Fourcc,
+) -> Result<GlesTexture, GlesError> {
+    let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+    renderer.create_buffer(fourcc, buffer_size)
+}
+
+pub fn copy_framebuffer(
+    renderer: &mut GlesRenderer,
+    target: &GlesTarget,
+    fourcc: Fourcc,
+) -> Result<GlesMapping, GlesError> {
+    renderer.copy_framebuffer(target, Rectangle::from_size(target.size()), fourcc)
+}
+
 pub fn render_to_encompassing_texture(
     renderer: &mut GlesRenderer,
     scale: Scale<f64>,
@@ -157,13 +196,9 @@ pub fn render_to_encompassing_texture(
     fourcc: Fourcc,
     elements: &[impl RenderElement<GlesRenderer>],
 ) -> anyhow::Result<(GlesTexture, SyncPoint, Rectangle<i32, Physical>)> {
-    let geo = elements
-        .iter()
-        .map(|ele| ele.geometry(scale))
-        .reduce(|a, b| a.merge(b))
-        .unwrap_or_default();
+    let geo = encompassing_geo(scale, elements.iter());
     let elements = elements.iter().rev().map(|ele| {
-        RelocateRenderElement::from_element(ele, (-geo.loc.x, -geo.loc.y), Relocate::Relative)
+        RelocateRenderElement::from_element(ele, geo.loc.upscale(-1), Relocate::Relative)
     });
 
     let (texture, sync_point) =
@@ -182,17 +217,16 @@ pub fn render_to_texture(
 ) -> anyhow::Result<(GlesTexture, SyncPoint)> {
     let _span = tracy_client::span!();
 
-    let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+    let mut texture = create_texture(renderer, size, fourcc).context("error creating texture")?;
 
-    let texture: GlesTexture = renderer
-        .create_buffer(fourcc, buffer_size)
-        .context("error creating texture")?;
+    let sync_point = {
+        let mut target = renderer
+            .bind(&mut texture)
+            .context("error binding texture")?;
 
-    renderer
-        .bind(texture.clone())
-        .context("error binding texture")?;
+        render_elements(renderer, &mut target, size, scale, transform, elements)?
+    };
 
-    let sync_point = render_elements(renderer, size, scale, transform, elements)?;
     Ok((texture, sync_point))
 }
 
@@ -206,13 +240,44 @@ pub fn render_and_download(
 ) -> anyhow::Result<GlesMapping> {
     let _span = tracy_client::span!();
 
-    let (_, _) = render_to_texture(renderer, size, scale, transform, fourcc, elements)?;
+    let mut texture = create_texture(renderer, size, fourcc).context("error creating texture")?;
+    let mut target = renderer
+        .bind(&mut texture)
+        .context("error binding texture")?;
 
-    let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
-    let mapping = renderer
-        .copy_framebuffer(Rectangle::from_loc_and_size((0, 0), buffer_size), fourcc)
-        .context("error copying framebuffer")?;
-    Ok(mapping)
+    let _sync = render_elements(renderer, &mut target, size, scale, transform, elements)
+        .context("error rendering")?;
+
+    copy_framebuffer(renderer, &target, fourcc).context("error copying framebuffer")
+}
+
+pub fn render_and_download_with_damage(
+    renderer: &mut GlesRenderer,
+    damage_tracker: &mut OutputDamageTracker,
+    fourcc: Fourcc,
+    elements: &[impl RenderElement<GlesRenderer>],
+    states: RenderElementStates,
+) -> anyhow::Result<GlesMapping> {
+    let _span = tracy_client::span!();
+
+    let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
+    let mut texture = create_texture(renderer, size, fourcc).context("error creating texture")?;
+    let mut target = renderer
+        .bind(&mut texture)
+        .context("error binding texture")?;
+
+    let _res = damage_tracker
+        .render_output_with_states(
+            renderer,
+            &mut target,
+            0,
+            elements,
+            Color32F::TRANSPARENT,
+            states,
+        )
+        .context("error rendering")?;
+
+    copy_framebuffer(renderer, &target, fourcc).context("error copying framebuffer")
 }
 
 pub fn render_to_vec(
@@ -233,53 +298,118 @@ pub fn render_to_vec(
     Ok(copy.to_vec())
 }
 
-#[cfg(feature = "xdp-gnome-screencast")]
 pub fn render_to_dmabuf(
     renderer: &mut GlesRenderer,
-    dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
-    size: Size<i32, Physical>,
-    scale: Scale<f64>,
-    transform: Transform,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
+    damage_tracker: &mut OutputDamageTracker,
+    mut dmabuf: Dmabuf,
+    elements: &[impl RenderElement<GlesRenderer>],
+    states: RenderElementStates,
 ) -> anyhow::Result<SyncPoint> {
     let _span = tracy_client::span!();
-    renderer.bind(dmabuf).context("error binding texture")?;
-    render_elements(renderer, size, scale, transform, elements)
+    let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
+    ensure!(
+        dmabuf.width() == size.w as u32 && dmabuf.height() == size.h as u32,
+        "invalid buffer size"
+    );
+
+    let mut target = renderer.bind(&mut dmabuf).context("error binding dmabuf")?;
+    let res = damage_tracker
+        .render_output_with_states(
+            renderer,
+            &mut target,
+            0,
+            elements,
+            Color32F::TRANSPARENT,
+            states,
+        )
+        .context("error rendering to dmabuf")?;
+    Ok(res.sync)
 }
 
 pub fn render_to_shm(
     renderer: &mut GlesRenderer,
+    damage_tracker: &mut OutputDamageTracker,
     buffer: &WlBuffer,
-    scale: Scale<f64>,
-    transform: Transform,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
+    format: wl_shm::Format,
+    elements: &[impl RenderElement<GlesRenderer>],
+    states: RenderElementStates,
 ) -> anyhow::Result<()> {
     let _span = tracy_client::span!();
+    // The pointer and length are the client's entire pool, which may hold other
+    // buffers besides this one... buffer_data is the one we want.
+    shm::with_buffer_contents_mut(buffer, |pool, pool_len, buffer_data| {
+        let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
+        let fourcc = match format {
+            wl_shm::Format::Xrgb8888 => Fourcc::Xrgb8888,
+            wl_shm::Format::Argb8888 => Fourcc::Argb8888,
+            _ => bail!("unsupported shm format: {format:?}"),
+        };
 
-    let buffer_size = buffer_dimensions(buffer).context("error getting buffer dimensions")?;
-    let size = buffer_size.to_logical(1, Transform::Normal).to_physical(1);
-
-    let mapping =
-        render_and_download(renderer, size, scale, transform, Fourcc::Argb8888, elements)?;
-    let bytes = renderer
-        .map_texture(&mapping)
-        .context("error mapping texture")?;
-
-    shm::with_buffer_contents_mut(buffer, |shm_buffer, shm_len, buffer_data| {
         ensure!(
             // The buffer prefers pixels in little endian ...
-            buffer_data.format == wl_shm::Format::Argb8888
-                && buffer_data.stride == size.w * 4
-                && buffer_data.height == size.h
-                && shm_len as i32 == buffer_data.stride * buffer_data.height,
+            buffer_data.format == format
+                && buffer_data.width == size.w
+                && buffer_data.height == size.h,
             "invalid buffer format or size"
         );
 
-        ensure!(bytes.len() == shm_len, "mapped buffer has wrong length");
+        // The client chooses the stride and may pad rows, so only the first
+        // row_len bytes can be used here.
+        let row_len = size.w as usize * 4;
+        let height = size.h as usize;
+        let offset = usize::try_from(buffer_data.offset).context("negative buffer offset")?;
+        let stride = usize::try_from(buffer_data.stride).context("negative buffer stride")?;
+
+        // This should have already been validated by wl_shm, and a pool can
+        // only grow, but check again just in case.
+        let end = stride
+            .checked_mul(height.saturating_sub(1))
+            .and_then(|len| len.checked_add(row_len))
+            .and_then(|len| len.checked_add(offset));
+        ensure!(
+            stride >= row_len && end.is_some_and(|end| end <= pool_len),
+            "buffer does not fit in its shm pool"
+        );
+
+        let mut texture =
+            create_texture(renderer, size, fourcc).context("error creating texture")?;
+        let mut target = renderer
+            .bind(&mut texture)
+            .context("error binding texture")?;
+
+        let _res = damage_tracker
+            .render_output_with_states(
+                renderer,
+                &mut target,
+                0,
+                elements,
+                Color32F::TRANSPARENT,
+                states,
+            )
+            .context("error rendering")?;
+
+        let mapping =
+            copy_framebuffer(renderer, &target, fourcc).context("error copying framebuffer")?;
+        let bytes = renderer
+            .map_texture(&mapping)
+            .context("error mapping texture")?;
+
+        ensure!(bytes.len() >= row_len * height, "short texture mapping");
 
         unsafe {
             let _span = tracy_client::span!("copy_nonoverlapping");
-            ptr::copy_nonoverlapping(bytes.as_ptr(), shm_buffer.cast(), shm_len);
+            let dst = pool.add(offset);
+            if stride == row_len {
+                ptr::copy_nonoverlapping(bytes.as_ptr(), dst, row_len * height);
+            } else {
+                for y in 0..height {
+                    ptr::copy_nonoverlapping(
+                        bytes.as_ptr().add(y * row_len),
+                        dst.add(y * stride),
+                        row_len,
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -287,22 +417,36 @@ pub fn render_to_shm(
     .context("expected shm buffer, but didn't get one")?
 }
 
+pub fn clear_dmabuf(renderer: &mut GlesRenderer, mut dmabuf: Dmabuf) -> anyhow::Result<SyncPoint> {
+    let size = dmabuf.size();
+    let size = size.to_logical(1, Transform::Normal).to_physical(1);
+    let mut target = renderer.bind(&mut dmabuf).context("error binding dmabuf")?;
+    let mut frame = renderer
+        .render(&mut target, size, Transform::Normal)
+        .context("error starting frame")?;
+    frame
+        .clear(Color32F::TRANSPARENT, &[Rectangle::from_size(size)])
+        .context("error clearing")?;
+    frame.finish().context("error finishing frame")
+}
+
 fn render_elements(
     renderer: &mut GlesRenderer,
+    target: &mut GlesTarget,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
     elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
 ) -> anyhow::Result<SyncPoint> {
     let transform = transform.invert();
-    let output_rect = Rectangle::from_loc_and_size((0, 0), transform.transform_size(size));
+    let output_rect = Rectangle::from_size(transform.transform_size(size));
 
     let mut frame = renderer
-        .render(size, transform)
+        .render(target, size, transform)
         .context("error starting frame")?;
 
     frame
-        .clear([0., 0., 0., 0.], &[output_rect])
+        .clear(Color32F::TRANSPARENT, &[output_rect])
         .context("error clearing")?;
 
     for element in elements {
@@ -311,8 +455,15 @@ fn render_elements(
 
         if let Some(mut damage) = output_rect.intersection(dst) {
             damage.loc -= dst.loc;
+
+            let cache = UserDataMap::new();
+            if element.is_framebuffer_effect() {
+                element
+                    .capture_framebuffer(&mut frame, src, dst, &cache)
+                    .context("error in capture_framebuffer()")?;
+            }
             element
-                .draw(&mut frame, src, dst, &[damage], &[])
+                .draw(&mut frame, src, dst, &[damage], &[], Some(&cache))
                 .context("error drawing element")?;
         }
     }

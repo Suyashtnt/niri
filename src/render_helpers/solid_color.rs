@@ -1,6 +1,7 @@
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
-use smithay::backend::renderer::{Frame as _, Renderer};
+use smithay::backend::renderer::{Color32F, Frame as _, Renderer};
+use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
 
 /// Smithay's solid color buffer, but with fractional scale.
@@ -9,7 +10,7 @@ pub struct SolidColorBuffer {
     id: Id,
     size: Size<f64, Logical>,
     commit: CommitCounter,
-    color: [f32; 4],
+    color: Color32F,
 }
 
 /// Render element for a [`SolidColorBuffer`].
@@ -18,7 +19,7 @@ pub struct SolidColorRenderElement {
     id: Id,
     geometry: Rectangle<f64, Logical>,
     commit: CommitCounter,
-    color: [f32; 4],
+    color: Color32F,
     kind: Kind,
 }
 
@@ -34,10 +35,10 @@ impl Default for SolidColorBuffer {
 }
 
 impl SolidColorBuffer {
-    pub fn new(size: impl Into<Size<f64, Logical>>, color: [f32; 4]) -> Self {
+    pub fn new(size: impl Into<Size<f64, Logical>>, color: impl Into<Color32F>) -> Self {
         SolidColorBuffer {
             id: Id::new(),
-            color,
+            color: color.into(),
             commit: CommitCounter::default(),
             size: size.into(),
         }
@@ -51,15 +52,17 @@ impl SolidColorBuffer {
         }
     }
 
-    pub fn set_color(&mut self, color: [f32; 4]) {
+    pub fn set_color(&mut self, color: impl Into<Color32F>) {
+        let color = color.into();
         if color != self.color {
             self.color = color;
             self.commit.increment();
         }
     }
 
-    pub fn update(&mut self, size: impl Into<Size<f64, Logical>>, color: [f32; 4]) {
+    pub fn update(&mut self, size: impl Into<Size<f64, Logical>>, color: impl Into<Color32F>) {
         let size = size.into();
+        let color = color.into();
         if size != self.size || color != self.color {
             self.size = size;
             self.color = color;
@@ -67,7 +70,7 @@ impl SolidColorBuffer {
         }
     }
 
-    pub fn color(&self) -> [f32; 4] {
+    pub fn color(&self) -> Color32F {
         self.color
     }
 
@@ -83,13 +86,8 @@ impl SolidColorRenderElement {
         alpha: f32,
         kind: Kind,
     ) -> Self {
-        let geo = Rectangle::from_loc_and_size(location, buffer.size());
-        let color = [
-            buffer.color[0] * alpha,
-            buffer.color[1] * alpha,
-            buffer.color[2] * alpha,
-            buffer.color[3] * alpha,
-        ];
+        let geo = Rectangle::new(location.into(), buffer.size());
+        let color = buffer.color * alpha;
         Self::new(buffer.id.clone(), geo, buffer.commit, color, kind)
     }
 
@@ -97,7 +95,7 @@ impl SolidColorRenderElement {
         id: Id,
         geometry: Rectangle<f64, Logical>,
         commit: CommitCounter,
-        color: [f32; 4],
+        color: Color32F,
         kind: Kind,
     ) -> Self {
         SolidColorRenderElement {
@@ -109,7 +107,7 @@ impl SolidColorRenderElement {
         }
     }
 
-    pub fn color(&self) -> [f32; 4] {
+    pub fn color(&self) -> Color32F {
         self.color
     }
 
@@ -128,7 +126,7 @@ impl Element for SolidColorRenderElement {
     }
 
     fn src(&self) -> Rectangle<f64, Buffer> {
-        Rectangle::from_loc_and_size((0., 0.), (1., 1.))
+        Rectangle::from_size(Size::from((1., 1.)))
     }
 
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
@@ -136,9 +134,8 @@ impl Element for SolidColorRenderElement {
     }
 
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        if self.color[3] == 1f32 {
-            let rect = Rectangle::from_loc_and_size((0., 0.), self.geometry.size)
-                .to_physical_precise_down(scale);
+        if self.color.is_opaque() {
+            let rect = Rectangle::from_size(self.geometry.size).to_physical_precise_down(scale);
             OpaqueRegions::from_slice(&[rect])
         } else {
             OpaqueRegions::default()
@@ -146,7 +143,7 @@ impl Element for SolidColorRenderElement {
     }
 
     fn alpha(&self) -> f32 {
-        self.color[3]
+        self.color.a()
     }
 
     fn kind(&self) -> Kind {
@@ -157,12 +154,13 @@ impl Element for SolidColorRenderElement {
 impl<R: Renderer> RenderElement<R> for SolidColorRenderElement {
     fn draw(
         &self,
-        frame: &mut <R as Renderer>::Frame<'_>,
+        frame: &mut R::Frame<'_, '_>,
         _src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
-    ) -> Result<(), <R as Renderer>::Error> {
+        _cache: Option<&UserDataMap>,
+    ) -> Result<(), R::Error> {
         frame.draw_solid(dst, damage, self.color)
     }
 

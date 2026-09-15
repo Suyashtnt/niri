@@ -1,27 +1,212 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::Duration;
 
-use smithay::output::Output;
-use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_frame_v1::{
-    Flags, ZwlrScreencopyFrameV1,
-};
-use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
+use calloop::generic::Generic;
+use calloop::{Interest, LoopHandle, Mode, PostAction};
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::{Buffer, Fourcc};
+use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::renderer::sync::SyncPoint;
+use smithay::output::{Output, WeakOutput};
 use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::{
     zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
 };
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
-use smithay::reexports::wayland_server::protocol::wl_shm;
+use smithay::reexports::wayland_server::protocol::wl_shm::Format;
 use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
-use smithay::utils::{Physical, Point, Rectangle, Size};
-use smithay::wayland::shm;
+use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
+use smithay::wayland::{dmabuf, shm, Dispatch2, GlobalDispatch2};
+use wayland_backend::server::Credentials;
+use zwlr_screencopy_frame_v1::{Flags, ZwlrScreencopyFrameV1};
+use zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 
-// We do not support copy_with_damage() semantics yet.
-const VERSION: u32 = 1;
+use crate::protocols::EmptyData;
+use crate::utils::{get_credentials_for_client, get_monotonic_time, CastSessionId, CastStreamId};
 
-pub struct ScreencopyManagerState;
+const VERSION: u32 = 3;
+
+fn screencopy_shm_buffer_stride(size: Size<i32, Physical>) -> i32 {
+    size.w * 4
+}
+
+/// Inactivity timeout for considering a screencopy cast as stopped.
+///
+/// xdg-desktop-portal-wlr keeps the screencopy manager alive across casts, so there's no way to
+/// tell that a screencast had stopped. So we use a timeout: if no new with_damage frames are
+/// requested for this timeout, consider the screencast finished.
+const CAST_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub struct ScreencopyQueue {
+    /// Credentials of this wlr-screencopy client, if known.
+    credentials: Option<Credentials>,
+    damage_tracker: OutputDamageTracker,
+    /// Frames waiting for the client to call copy or destroy.
+    pending_frames: HashSet<ZwlrScreencopyFrameV1>,
+    /// Queue of screencopies waiting for a corresponding output redraw with damage.
+    screencopies: Vec<Screencopy>,
+    /// Cast tracking, set when the first with_damage request arrives.
+    cast: Option<ScreencopyCast>,
+}
+
+pub struct ScreencopyCast {
+    pub session_id: CastSessionId,
+    pub stream_id: CastStreamId,
+    /// Output being captured.
+    ///
+    /// Generally equal to the front entry in the queue, and persisted here when the queue becomes
+    /// empty.
+    pub output: WeakOutput,
+    /// Cached name of the output.
+    pub output_name: String,
+    /// Deadline after which this cast is considered stopped if no new frames arrive.
+    pub deadline: Duration,
+}
+
+impl ScreencopyCast {
+    fn new(output: &Output) -> Self {
+        Self {
+            session_id: CastSessionId::next(),
+            stream_id: CastStreamId::next(),
+            output: output.downgrade(),
+            output_name: output.name(),
+            deadline: get_monotonic_time() + CAST_TIMEOUT,
+        }
+    }
+
+    fn update_deadline(&mut self) {
+        self.deadline = get_monotonic_time() + CAST_TIMEOUT;
+    }
+
+    fn update_output(&mut self, output: &Output) {
+        // Only allocate a new name when the output differs.
+        let weak = output.downgrade();
+        if self.output != weak {
+            self.output = weak;
+            self.output_name = output.name();
+        }
+    }
+}
+
+impl ScreencopyQueue {
+    pub fn new(credentials: Option<Credentials>) -> Self {
+        Self {
+            damage_tracker: OutputDamageTracker::new((0, 0), 1.0, Transform::Normal),
+            pending_frames: HashSet::new(),
+            screencopies: Vec::new(),
+            cast: None,
+            credentials,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending_frames.is_empty() && self.screencopies.is_empty()
+    }
+
+    /// Get the cast tracking info, if this queue is tracking a cast.
+    pub fn cast(&self) -> Option<&ScreencopyCast> {
+        self.cast.as_ref()
+    }
+
+    pub fn credentials(&self) -> Option<Credentials> {
+        self.credentials
+    }
+
+    pub fn split(&mut self) -> (&mut OutputDamageTracker, Option<&Screencopy>) {
+        let ScreencopyQueue {
+            damage_tracker,
+            screencopies,
+            ..
+        } = self;
+        (damage_tracker, screencopies.first())
+    }
+
+    pub fn push(&mut self, screencopy: Screencopy) {
+        // Screencopy without damage is rendered immediately without the queue.
+        if !screencopy.with_damage() {
+            error!("only screencopy with damage can be pushed in the queue");
+        }
+
+        if let Some(cast) = &mut self.cast {
+            // Update cast output when pushing a new front screencopy.
+            if self.screencopies.is_empty() {
+                cast.update_output(screencopy.output());
+            }
+        } else {
+            // First with_damage request, mark this as a screencast.
+            let output = screencopy.output();
+            self.cast = Some(ScreencopyCast::new(output));
+        }
+
+        self.screencopies.push(screencopy);
+    }
+
+    pub fn pop(&mut self) -> Screencopy {
+        let rv = self.screencopies.remove(0);
+
+        let cast = self.cast.as_mut().unwrap();
+        if let Some(first) = self.screencopies.first() {
+            // Update cast output (most of the time we expect this to be the same).
+            cast.update_output(first.output());
+        } else {
+            // Queue became empty, update deadline for considering the cast stopped.
+            cast.update_deadline();
+        }
+
+        rv
+    }
+
+    pub fn clear_expired_cast(&mut self) {
+        if let Some(cast) = &self.cast {
+            // Check deadline if there are no in-flight frames.
+            if self.screencopies.is_empty() && cast.deadline <= get_monotonic_time() {
+                self.cast = None;
+            }
+        }
+    }
+
+    fn remove_output(&mut self, output: &Output) {
+        if self.screencopies.is_empty() {
+            return;
+        }
+
+        self.screencopies
+            .retain(|screencopy| screencopy.output() != output);
+
+        if let Some(cast) = &mut self.cast {
+            if self.screencopies.is_empty() {
+                // Queue became empty, update deadline for considering the cast stopped.
+                cast.update_deadline();
+            }
+        }
+    }
+
+    fn remove_frame(&mut self, frame: &ZwlrScreencopyFrameV1) {
+        self.pending_frames.remove(frame);
+
+        if self.screencopies.is_empty() {
+            return;
+        }
+
+        self.screencopies
+            .retain(|screencopy| screencopy.frame != *frame);
+
+        if let Some(cast) = &mut self.cast {
+            if self.screencopies.is_empty() {
+                // Queue became empty, update deadline for considering the cast stopped.
+                cast.update_deadline();
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct ScreencopyManagerState {
+    queues: HashMap<ZwlrScreencopyManagerV1, ScreencopyQueue>,
+}
 
 pub struct ScreencopyManagerGlobalData {
     filter: Box<dyn for<'c> Fn(&'c Client) -> bool + Send + Sync>,
@@ -31,8 +216,6 @@ impl ScreencopyManagerState {
     pub fn new<D, F>(display: &DisplayHandle, filter: F) -> Self
     where
         D: GlobalDispatch<ZwlrScreencopyManagerV1, ScreencopyManagerGlobalData>,
-        D: Dispatch<ZwlrScreencopyManagerV1, ()>,
-        D: Dispatch<ZwlrScreencopyFrameV1, ScreencopyFrameState>,
         D: ScreencopyHandler,
         D: 'static,
         F: for<'c> Fn(&'c Client) -> bool + Send + Sync + 'static,
@@ -42,49 +225,101 @@ impl ScreencopyManagerState {
         };
         display.create_global::<D, ZwlrScreencopyManagerV1, _>(VERSION, global_data);
 
-        Self
+        Self {
+            queues: HashMap::new(),
+        }
+    }
+
+    pub fn push(&mut self, manager: &ZwlrScreencopyManagerV1, screencopy: Screencopy) {
+        let Some(queue) = self.queues.get_mut(manager) else {
+            // Destroying the manager does not invalidate existing frames, so the queue should
+            // keep existing.
+            error!("screencopy queue must not be deleted as long as frames exist");
+            return;
+        };
+
+        queue.push(screencopy);
+    }
+
+    pub fn damage_tracker(
+        &mut self,
+        manager: &ZwlrScreencopyManagerV1,
+    ) -> Option<&mut OutputDamageTracker> {
+        let queue = self.queues.get_mut(manager)?;
+        Some(&mut queue.damage_tracker)
+    }
+
+    pub fn remove_output(&mut self, output: &Output) {
+        for queue in self.queues.values_mut() {
+            queue.remove_output(output);
+        }
+
+        self.cleanup_queues();
+    }
+
+    pub fn queues(&self) -> impl Iterator<Item = &ScreencopyQueue> {
+        self.queues.values()
+    }
+
+    pub fn with_queues_mut(&mut self, mut f: impl FnMut(&mut ScreencopyQueue)) {
+        for queue in self.queues.values_mut() {
+            f(queue);
+        }
+
+        self.cleanup_queues();
+    }
+
+    fn cleanup_queues(&mut self) {
+        self.queues
+            .retain(|manager, queue| manager.is_alive() || !queue.is_empty());
+    }
+
+    pub fn clear_expired_casts(&mut self) {
+        for queue in self.queues.values_mut() {
+            queue.clear_expired_cast();
+        }
     }
 }
 
-impl<D> GlobalDispatch<ZwlrScreencopyManagerV1, ScreencopyManagerGlobalData, D>
-    for ScreencopyManagerState
+impl<D> GlobalDispatch2<ZwlrScreencopyManagerV1, D> for ScreencopyManagerGlobalData
 where
-    D: GlobalDispatch<ZwlrScreencopyManagerV1, ScreencopyManagerGlobalData>,
-    D: Dispatch<ZwlrScreencopyManagerV1, ()>,
-    D: Dispatch<ZwlrScreencopyFrameV1, ScreencopyFrameState>,
+    D: Dispatch<ZwlrScreencopyManagerV1, EmptyData>,
     D: ScreencopyHandler,
     D: 'static,
 {
     fn bind(
-        _state: &mut D,
-        _display: &DisplayHandle,
-        _client: &Client,
+        &self,
+        state: &mut D,
+        dh: &DisplayHandle,
+        client: &Client,
         manager: New<ZwlrScreencopyManagerV1>,
-        _manager_state: &ScreencopyManagerGlobalData,
         data_init: &mut DataInit<'_, D>,
     ) {
-        data_init.init(manager, ());
+        let manager = data_init.init(manager, EmptyData);
+
+        let state = state.screencopy_state();
+        let credentials = get_credentials_for_client(dh, client);
+        let queue = ScreencopyQueue::new(credentials);
+        state.queues.insert(manager.clone(), queue);
     }
 
-    fn can_view(client: Client, global_data: &ScreencopyManagerGlobalData) -> bool {
-        (global_data.filter)(&client)
+    fn can_view(&self, client: &Client) -> bool {
+        (self.filter)(client)
     }
 }
 
-impl<D> Dispatch<ZwlrScreencopyManagerV1, (), D> for ScreencopyManagerState
+impl<D> Dispatch2<ZwlrScreencopyManagerV1, D> for EmptyData
 where
-    D: GlobalDispatch<ZwlrScreencopyManagerV1, ScreencopyManagerGlobalData>,
-    D: Dispatch<ZwlrScreencopyManagerV1, ()>,
     D: Dispatch<ZwlrScreencopyFrameV1, ScreencopyFrameState>,
     D: ScreencopyHandler,
     D: 'static,
 {
     fn request(
-        _state: &mut D,
+        &self,
+        state: &mut D,
         _client: &Client,
-        _manager: &ZwlrScreencopyManagerV1,
+        manager: &ZwlrScreencopyManagerV1,
         request: zwlr_screencopy_manager_v1::Request,
-        _data: &(),
         _display: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
     ) {
@@ -132,12 +367,12 @@ where
                 let output_transform = output.current_transform();
                 let output_physical_size =
                     output_transform.transform_size(output.current_mode().unwrap().size);
-                let output_rect = Rectangle::from_loc_and_size((0, 0), output_physical_size);
+                let output_rect = Rectangle::from_size(output_physical_size);
 
-                let rect = Rectangle::from_loc_and_size((x, y), (width, height));
+                let rect = Rectangle::new(Point::from((x, y)), Size::from((width, height)));
 
-                let output_scale = output.current_scale().integer_scale();
-                let physical_rect = rect.to_physical(output_scale);
+                let output_scale = output.current_scale().fractional_scale();
+                let physical_rect = rect.to_physical_precise_round(output_scale);
 
                 // Clamp captured region to the output.
                 let Some(clamped_rect) = physical_rect.intersection(output_rect) else {
@@ -174,6 +409,7 @@ where
         let frame = data_init.init(
             frame,
             ScreencopyFrameState::Pending {
+                manager: manager.clone(),
                 info,
                 copied: Arc::new(AtomicBool::new(false)),
             },
@@ -181,48 +417,68 @@ where
 
         // Send desired SHM buffer parameters.
         frame.buffer(
-            wl_shm::Format::Argb8888,
+            Format::Xrgb8888,
             buffer_size.w as u32,
             buffer_size.h as u32,
-            buffer_size.w as u32 * 4,
+            screencopy_shm_buffer_stride(buffer_size) as u32,
         );
 
-        // if manager.version() >= 3 {
-        //     // Send desired DMA buffer parameters.
-        //     frame.linux_dmabuf(
-        //         Fourcc::Argb8888 as u32,
-        //         buffer_size.w as u32,
-        //         buffer_size.h as u32,
-        //     );
-        //
-        //     // Notify client that all supported buffers were enumerated.
-        //     frame.buffer_done();
-        // }
+        if frame.version() >= 3 {
+            // Send desired DMA buffer parameters.
+            frame.linux_dmabuf(
+                Fourcc::Xrgb8888 as u32,
+                buffer_size.w as u32,
+                buffer_size.h as u32,
+            );
+
+            // Notify client that all supported buffers were enumerated.
+            frame.buffer_done();
+        }
+
+        let state = state.screencopy_state();
+        let queue = state.queues.get_mut(manager).unwrap();
+        queue.pending_frames.insert(frame);
+    }
+
+    fn destroyed(
+        &self,
+        state: &mut D,
+        _client: wayland_backend::server::ClientId,
+        manager: &ZwlrScreencopyManagerV1,
+    ) {
+        let state = state.screencopy_state();
+
+        let Some(queue) = state.queues.get_mut(manager) else {
+            // This happened once. I'm really not sure how exactly though.
+            //
+            // I've dug into wayland-server and wayland-backend, and apparently there are a bunch
+            // of places where calling destroyed() is delayed (even on a +1 ms timer). Then, it's
+            // quite possible for some code to run cleanup_queues() *before* this destroyed()
+            // handler, and delete the queue because the manager is no longer .is_alive() by then.
+            // Then, queue will be None here.
+            //
+            // My attempts to reproduce this in a test have failed though. Perhaps it requires a
+            // tricky timing condition where the client disconnects at some precise spot inside our
+            // State::refresh_and_flush_clients() call.
+            return;
+        };
+
+        // Clean up the queue if this was the last object.
+        if queue.is_empty() {
+            state.queues.remove(manager);
+        }
     }
 }
 
 /// Handler trait for wlr-screencopy.
 pub trait ScreencopyHandler {
     /// Handle new screencopy request.
-    fn frame(&mut self, frame: Screencopy);
-}
+    ///
+    /// The handler must synchronously either ready/fail the screencopy, or submit it to the
+    /// manager queue.
+    fn frame(&mut self, manager: &ZwlrScreencopyManagerV1, screencopy: Screencopy);
 
-#[allow(missing_docs)]
-#[macro_export]
-macro_rules! delegate_screencopy {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        smithay::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1: $crate::protocols::screencopy::ScreencopyManagerGlobalData
-        ] => $crate::protocols::screencopy::ScreencopyManagerState);
-
-        smithay::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1: ()
-        ] => $crate::protocols::screencopy::ScreencopyManagerState);
-
-        smithay::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1: $crate::protocols::screencopy::ScreencopyFrameState
-        ] => $crate::protocols::screencopy::ScreencopyManagerState);
-    };
+    fn screencopy_state(&mut self) -> &mut ScreencopyManagerState;
 }
 
 #[derive(Clone)]
@@ -236,23 +492,23 @@ pub struct ScreencopyFrameInfo {
 pub enum ScreencopyFrameState {
     Failed,
     Pending {
+        manager: ZwlrScreencopyManagerV1,
         info: ScreencopyFrameInfo,
         copied: Arc<AtomicBool>,
     },
 }
 
-impl<D> Dispatch<ZwlrScreencopyFrameV1, ScreencopyFrameState, D> for ScreencopyManagerState
+impl<D> Dispatch2<ZwlrScreencopyFrameV1, D> for ScreencopyFrameState
 where
-    D: Dispatch<ZwlrScreencopyFrameV1, ScreencopyFrameState>,
     D: ScreencopyHandler,
     D: 'static,
 {
     fn request(
+        &self,
         state: &mut D,
         _client: &Client,
         frame: &ZwlrScreencopyFrameV1,
         request: zwlr_screencopy_frame_v1::Request,
-        data: &ScreencopyFrameState,
         _display: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
@@ -260,9 +516,13 @@ where
             return;
         }
 
-        let (info, copied) = match data {
-            ScreencopyFrameState::Failed => return,
-            ScreencopyFrameState::Pending { info, copied } => (info, copied),
+        let ScreencopyFrameState::Pending {
+            manager,
+            info,
+            copied,
+        } = self
+        else {
+            return;
         };
 
         if copied.load(Ordering::SeqCst) {
@@ -275,44 +535,104 @@ where
 
         let (buffer, with_damage) = match request {
             zwlr_screencopy_frame_v1::Request::Copy { buffer } => (buffer, false),
-            // zwlr_screencopy_frame_v1::Request::CopyWithDamage { buffer } => (buffer, true),
+            zwlr_screencopy_frame_v1::Request::CopyWithDamage { buffer } => (buffer, true),
             _ => unreachable!(),
         };
 
-        if !shm::with_buffer_contents(&buffer, |_buf, shm_len, buffer_data| {
-            buffer_data.format == wl_shm::Format::Argb8888
-                && buffer_data.stride == info.buffer_size.w * 4
-                && buffer_data.height == info.buffer_size.h
-                && shm_len as i32 == buffer_data.stride * buffer_data.height
+        let size = info.buffer_size;
+
+        let buffer = if let Ok(dmabuf) = dmabuf::get_dmabuf(&buffer) {
+            if dmabuf.format().code == Fourcc::Xrgb8888
+                && dmabuf.width() == size.w as u32
+                && dmabuf.height() == size.h as u32
+            {
+                ScreencopyBuffer::Dmabuf(dmabuf.clone())
+            } else {
+                frame.post_error(
+                    zwlr_screencopy_frame_v1::Error::InvalidBuffer,
+                    "invalid dmabuf parameters",
+                );
+                return;
+            }
+        } else if shm::with_buffer_contents(&buffer, |_, _, buffer_data| {
+            buffer_data.format == Format::Xrgb8888
+                && buffer_data.width == size.w
+                && buffer_data.height == size.h
+                && buffer_data.stride == screencopy_shm_buffer_stride(size)
         })
         .unwrap_or(false)
         {
+            ScreencopyBuffer::Shm(buffer)
+        } else {
             frame.post_error(
                 zwlr_screencopy_frame_v1::Error::InvalidBuffer,
                 "invalid buffer",
             );
             return;
-        }
+        };
 
         copied.store(true, Ordering::SeqCst);
 
-        state.frame(Screencopy {
-            with_damage,
-            buffer,
-            frame: frame.clone(),
-            info: info.clone(),
-            submitted: false,
-        });
+        state.frame(
+            manager,
+            Screencopy {
+                buffer,
+                frame: frame.clone(),
+                info: info.clone(),
+                with_damage,
+                submitted: false,
+            },
+        );
+
+        // By this point the frame should've been either copied or failed or pushed to the queue,
+        // so remove it from pending frames.
+        let state = state.screencopy_state();
+        let queue = state.queues.get_mut(manager).unwrap();
+        queue.pending_frames.remove(frame);
+        if queue.is_empty() && !manager.is_alive() {
+            state.queues.remove(manager);
+        }
     }
+
+    fn destroyed(
+        &self,
+        state: &mut D,
+        _client: wayland_backend::server::ClientId,
+        frame: &ZwlrScreencopyFrameV1,
+    ) {
+        let ScreencopyFrameState::Pending { manager, .. } = self else {
+            return;
+        };
+
+        let state = state.screencopy_state();
+        let Some(queue) = state.queues.get_mut(manager) else {
+            // I think this can happen when we post_error() on a pending frame? Either way better
+            // safe than sorry.
+            return;
+        };
+
+        queue.remove_frame(frame);
+
+        // Clean up the queue if this was the last object.
+        if queue.is_empty() && !manager.is_alive() {
+            state.queues.remove(manager);
+        }
+    }
+}
+
+/// Screencopy buffer.
+#[derive(Clone)]
+pub enum ScreencopyBuffer {
+    Dmabuf(Dmabuf),
+    Shm(WlBuffer),
 }
 
 /// Screencopy frame.
 pub struct Screencopy {
     info: ScreencopyFrameInfo,
     frame: ZwlrScreencopyFrameV1,
-    #[allow(unused)]
+    buffer: ScreencopyBuffer,
     with_damage: bool,
-    buffer: WlBuffer,
     submitted: bool,
 }
 
@@ -326,7 +646,7 @@ impl Drop for Screencopy {
 
 impl Screencopy {
     /// Get the target buffer to copy to.
-    pub fn buffer(&self) -> &WlBuffer {
+    pub fn buffer(&self) -> &ScreencopyBuffer {
         &self.buffer
     }
 
@@ -346,17 +666,19 @@ impl Screencopy {
         self.info.overlay_cursor
     }
 
-    // pub fn damage(&mut self, damage: &[Rectangle<i32, Physical>]) {
-    //     assert!(self.with_damage);
-    //
-    //     for Rectangle { loc, size } in damage {
-    //         self.frame
-    //             .damage(loc.x as u32, loc.y as u32, size.w as u32, size.h as u32);
-    //     }
-    // }
+    pub fn with_damage(&self) -> bool {
+        self.with_damage
+    }
+
+    pub fn damage(&self, damages: impl Iterator<Item = Rectangle<i32, smithay::utils::Buffer>>) {
+        for Rectangle { loc, size } in damages {
+            self.frame
+                .damage(loc.x as u32, loc.y as u32, size.w as u32, size.h as u32);
+        }
+    }
 
     /// Submit the copied content.
-    pub fn submit(mut self, y_invert: bool) {
+    fn submit(mut self, y_invert: bool, timestamp: Duration) {
         // Notify client that buffer is ordinary.
         self.frame.flags(if y_invert {
             Flags::YInvert
@@ -365,34 +687,34 @@ impl Screencopy {
         });
 
         // Notify client about successful copy.
-        let time = UNIX_EPOCH.elapsed().unwrap();
-        let tv_sec_hi = (time.as_secs() >> 32) as u32;
-        let tv_sec_lo = (time.as_secs() & 0xFFFFFFFF) as u32;
-        let tv_nsec = time.subsec_nanos();
+        let tv_sec_hi = (timestamp.as_secs() >> 32) as u32;
+        let tv_sec_lo = (timestamp.as_secs() & 0xFFFFFFFF) as u32;
+        let tv_nsec = timestamp.subsec_nanos();
         self.frame.ready(tv_sec_hi, tv_sec_lo, tv_nsec);
 
         // Mark frame as submitted to ensure destructor isn't run.
         self.submitted = true;
     }
 
-    // pub fn submit_after_sync<T>(
-    //     self,
-    //     y_invert: bool,
-    //     sync_point: Option<OwnedFd>,
-    //     event_loop: &LoopHandle<'_, T>,
-    // ) {
-    //     match sync_point {
-    //         None => self.submit(y_invert),
-    //         Some(sync_fd) => {
-    //             let source = Generic::new(sync_fd, Interest::READ, Mode::OneShot);
-    //             let mut screencopy = Some(self);
-    //             event_loop
-    //                 .insert_source(source, move |_, _, _| {
-    //                     screencopy.take().unwrap().submit(y_invert);
-    //                     Ok(PostAction::Remove)
-    //                 })
-    //                 .unwrap();
-    //         }
-    //     }
-    // }
+    pub fn submit_after_sync<T>(
+        self,
+        y_invert: bool,
+        sync_point: Option<SyncPoint>,
+        event_loop: &LoopHandle<'_, T>,
+    ) {
+        let timestamp = get_monotonic_time();
+        match sync_point.and_then(|s| s.export()) {
+            None => self.submit(y_invert, timestamp),
+            Some(sync_fd) => {
+                let source = Generic::new(sync_fd, Interest::READ, Mode::OneShot);
+                let mut screencopy = Some(self);
+                event_loop
+                    .insert_source(source, move |_, _, _| {
+                        screencopy.take().unwrap().submit(y_invert, timestamp);
+                        Ok(PostAction::Remove)
+                    })
+                    .unwrap();
+            }
+        }
+    }
 }

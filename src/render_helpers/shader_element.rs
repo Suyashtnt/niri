@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::rc::Rc;
 
 use glam::{Mat3, Vec2};
@@ -10,6 +10,7 @@ use smithay::backend::renderer::gles::{
 };
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
 use smithay::backend::renderer::DebugFlags;
+use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
 
 use super::renderer::AsGlesFrame;
@@ -28,7 +29,7 @@ pub struct ShaderRenderElement {
     // Should only be used for visual improvements, i.e. corner radius anti-aliasing.
     scale: f32,
     alpha: f32,
-    additional_uniforms: Vec<Uniform<'static>>,
+    additional_uniforms: Rc<[Uniform<'static>]>,
     textures: HashMap<String, GlesTexture>,
     kind: Kind,
 }
@@ -70,44 +71,37 @@ unsafe fn compile_program(
     texture_uniforms: &[&str],
     // destruction_callback_sender: Sender<CleanupResource>,
 ) -> Result<ShaderProgram, GlesError> {
-    let shader = format!("#version 100\n{}", src);
+    let shader = format!("#version 100\n{src}");
     let program = unsafe { link_program(gl, include_str!("shaders/texture.vert"), &shader)? };
-    let debug_shader = format!("#version 100\n#define DEBUG_FLAGS\n{}", src);
+    let debug_shader = format!("#version 100\n#define DEBUG_FLAGS\n{src}");
     let debug_program =
         unsafe { link_program(gl, include_str!("shaders/texture.vert"), &debug_shader)? };
 
-    let vert = CStr::from_bytes_with_nul(b"vert\0").expect("NULL terminated");
-    let vert_position = CStr::from_bytes_with_nul(b"vert_position\0").expect("NULL terminated");
-    let matrix = CStr::from_bytes_with_nul(b"matrix\0").expect("NULL terminated");
-    let tex_matrix = CStr::from_bytes_with_nul(b"tex_matrix\0").expect("NULL terminated");
-    let size = CStr::from_bytes_with_nul(b"niri_size\0").expect("NULL terminated");
-    let scale = CStr::from_bytes_with_nul(b"niri_scale\0").expect("NULL terminated");
-    let alpha = CStr::from_bytes_with_nul(b"niri_alpha\0").expect("NULL terminated");
-    let tint = CStr::from_bytes_with_nul(b"niri_tint\0").expect("NULL terminated");
+    let vert = c"vert";
+    let vert_position = c"vert_position";
+    let matrix = c"matrix";
+    let tex_matrix = c"tex_matrix";
+    let size = c"niri_size";
+    let scale = c"niri_scale";
+    let alpha = c"niri_alpha";
+    let tint = c"niri_tint";
 
     Ok(ShaderProgram(Rc::new(ShaderProgramInner {
         normal: ShaderProgramInternal {
             program,
-            uniform_matrix: gl
-                .GetUniformLocation(program, matrix.as_ptr() as *const ffi::types::GLchar),
-            uniform_tex_matrix: gl
-                .GetUniformLocation(program, tex_matrix.as_ptr() as *const ffi::types::GLchar),
-            uniform_size: gl
-                .GetUniformLocation(program, size.as_ptr() as *const ffi::types::GLchar),
-            uniform_scale: gl
-                .GetUniformLocation(program, scale.as_ptr() as *const ffi::types::GLchar),
-            uniform_alpha: gl
-                .GetUniformLocation(program, alpha.as_ptr() as *const ffi::types::GLchar),
-            attrib_vert: gl.GetAttribLocation(program, vert.as_ptr() as *const ffi::types::GLchar),
-            attrib_vert_position: gl
-                .GetAttribLocation(program, vert_position.as_ptr() as *const ffi::types::GLchar),
+            uniform_matrix: gl.GetUniformLocation(program, matrix.as_ptr()),
+            uniform_tex_matrix: gl.GetUniformLocation(program, tex_matrix.as_ptr()),
+            uniform_size: gl.GetUniformLocation(program, size.as_ptr()),
+            uniform_scale: gl.GetUniformLocation(program, scale.as_ptr()),
+            uniform_alpha: gl.GetUniformLocation(program, alpha.as_ptr()),
+            attrib_vert: gl.GetAttribLocation(program, vert.as_ptr()),
+            attrib_vert_position: gl.GetAttribLocation(program, vert_position.as_ptr()),
             additional_uniforms: additional_uniforms
                 .iter()
                 .map(|uniform| {
                     let name =
                         CString::new(uniform.name.as_bytes()).expect("Interior null in name");
-                    let location =
-                        gl.GetUniformLocation(program, name.as_ptr() as *const ffi::types::GLchar);
+                    let location = gl.GetUniformLocation(program, name.as_ptr());
                     (
                         uniform.name.clone().into_owned(),
                         UniformDesc {
@@ -121,41 +115,26 @@ unsafe fn compile_program(
                 .iter()
                 .map(|name_| {
                     let name = CString::new(name_.as_bytes()).expect("Interior null in name");
-                    let location =
-                        gl.GetUniformLocation(program, name.as_ptr() as *const ffi::types::GLchar);
+                    let location = gl.GetUniformLocation(program, name.as_ptr());
                     (name_.to_string(), location)
                 })
                 .collect(),
         },
         debug: ShaderProgramInternal {
             program: debug_program,
-            uniform_matrix: gl
-                .GetUniformLocation(debug_program, matrix.as_ptr() as *const ffi::types::GLchar),
-            uniform_tex_matrix: gl.GetUniformLocation(
-                debug_program,
-                tex_matrix.as_ptr() as *const ffi::types::GLchar,
-            ),
-            uniform_size: gl
-                .GetUniformLocation(debug_program, size.as_ptr() as *const ffi::types::GLchar),
-            uniform_scale: gl
-                .GetUniformLocation(debug_program, scale.as_ptr() as *const ffi::types::GLchar),
-            uniform_alpha: gl
-                .GetUniformLocation(debug_program, alpha.as_ptr() as *const ffi::types::GLchar),
-            attrib_vert: gl
-                .GetAttribLocation(debug_program, vert.as_ptr() as *const ffi::types::GLchar),
-            attrib_vert_position: gl.GetAttribLocation(
-                debug_program,
-                vert_position.as_ptr() as *const ffi::types::GLchar,
-            ),
+            uniform_matrix: gl.GetUniformLocation(debug_program, matrix.as_ptr()),
+            uniform_tex_matrix: gl.GetUniformLocation(debug_program, tex_matrix.as_ptr()),
+            uniform_size: gl.GetUniformLocation(debug_program, size.as_ptr()),
+            uniform_scale: gl.GetUniformLocation(debug_program, scale.as_ptr()),
+            uniform_alpha: gl.GetUniformLocation(debug_program, alpha.as_ptr()),
+            attrib_vert: gl.GetAttribLocation(debug_program, vert.as_ptr()),
+            attrib_vert_position: gl.GetAttribLocation(debug_program, vert_position.as_ptr()),
             additional_uniforms: additional_uniforms
                 .iter()
                 .map(|uniform| {
                     let name =
                         CString::new(uniform.name.as_bytes()).expect("Interior null in name");
-                    let location = gl.GetUniformLocation(
-                        debug_program,
-                        name.as_ptr() as *const ffi::types::GLchar,
-                    );
+                    let location = gl.GetUniformLocation(debug_program, name.as_ptr());
                     (
                         uniform.name.clone().into_owned(),
                         UniformDesc {
@@ -169,16 +148,12 @@ unsafe fn compile_program(
                 .iter()
                 .map(|name_| {
                     let name = CString::new(name_.as_bytes()).expect("Interior null in name");
-                    let location = gl.GetUniformLocation(
-                        debug_program,
-                        name.as_ptr() as *const ffi::types::GLchar,
-                    );
+                    let location = gl.GetUniformLocation(debug_program, name.as_ptr());
                     (name_.to_string(), location)
                 })
                 .collect(),
         },
-        uniform_tint: gl
-            .GetUniformLocation(debug_program, tint.as_ptr() as *const ffi::types::GLchar),
+        uniform_tint: gl.GetUniformLocation(debug_program, tint.as_ptr()),
     })))
 }
 
@@ -211,7 +186,7 @@ impl ShaderRenderElement {
         // Should only be used for visual improvements, i.e. corner radius anti-aliasing.
         scale: f32,
         alpha: f32,
-        uniforms: Vec<Uniform<'_>>,
+        additional_uniforms: Rc<[Uniform<'static>]>,
         textures: HashMap<String, GlesTexture>,
         kind: Kind,
     ) -> Self {
@@ -219,11 +194,11 @@ impl ShaderRenderElement {
             program,
             id: Id::new(),
             commit_counter: CommitCounter::default(),
-            area: Rectangle::from_loc_and_size((0., 0.), size),
+            area: Rectangle::from_size(size),
             opaque_regions: opaque_regions.unwrap_or_default(),
             scale,
             alpha,
-            additional_uniforms: uniforms.into_iter().map(|u| u.into_owned()).collect(),
+            additional_uniforms,
             textures,
             kind,
         }
@@ -238,7 +213,7 @@ impl ShaderRenderElement {
             opaque_regions: vec![],
             scale: 1.,
             alpha: 1.,
-            additional_uniforms: vec![],
+            additional_uniforms: Rc::new([]),
             textures: HashMap::new(),
             kind,
         }
@@ -253,13 +228,15 @@ impl ShaderRenderElement {
         size: Size<f64, Logical>,
         opaque_regions: Option<Vec<Rectangle<f64, Logical>>>,
         scale: f32,
-        uniforms: Vec<Uniform<'_>>,
+        alpha: f32,
+        uniforms: Rc<[Uniform<'static>]>,
         textures: HashMap<String, GlesTexture>,
     ) {
         self.area.size = size;
         self.opaque_regions = opaque_regions.unwrap_or_default();
         self.scale = scale;
-        self.additional_uniforms = uniforms.into_iter().map(|u| u.into_owned()).collect();
+        self.alpha = alpha;
+        self.additional_uniforms = uniforms;
         self.textures = textures;
 
         self.commit_counter.increment();
@@ -267,6 +244,11 @@ impl ShaderRenderElement {
 
     pub fn with_location(mut self, location: Point<f64, Logical>) -> Self {
         self.area.loc = location;
+        self
+    }
+
+    pub fn with_alpha(mut self, alpha: f32) -> Self {
+        self.alpha = alpha;
         self
     }
 }
@@ -281,7 +263,7 @@ impl Element for ShaderRenderElement {
     }
 
     fn src(&self) -> Rectangle<f64, Buffer> {
-        Rectangle::from_loc_and_size((0., 0.), (1., 1.))
+        Rectangle::from_size(Size::from((1., 1.)))
     }
 
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
@@ -296,7 +278,7 @@ impl Element for ShaderRenderElement {
     }
 
     fn alpha(&self) -> f32 {
-        1.0
+        self.alpha
     }
 
     fn kind(&self) -> Kind {
@@ -307,12 +289,15 @@ impl Element for ShaderRenderElement {
 impl RenderElement<GlesRenderer> for ShaderRenderElement {
     fn draw(
         &self,
-        frame: &mut GlesFrame<'_>,
+        frame: &mut GlesFrame<'_, '_>,
         src: Rectangle<f64, Buffer>,
         dest: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
+        _cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
+        let _span = tracy_client::span!("ShaderRenderElement::draw");
+
         let frame = frame.as_gles_frame();
 
         let Some(shader) = Shaders::get_from_frame(frame).program(self.program) else {
@@ -334,13 +319,13 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
 
                 let rect_constrained_loc = rect
                     .loc
-                    .constrain(Rectangle::from_extemities((0, 0), dest_size.to_point()));
+                    .constrain(Rectangle::from_extremities((0, 0), dest_size.to_point()));
                 let rect_clamped_size = rect.size.clamp(
                     (0, 0),
                     (dest_size.to_point() - rect_constrained_loc).to_size(),
                 );
 
-                let rect = Rectangle::from_loc_and_size(rect_constrained_loc, rect_clamped_size);
+                let rect = Rectangle::new(rect_constrained_loc, rect_clamped_size);
                 [
                     rect.loc.x as f32,
                     rect.loc.y as f32,
@@ -354,13 +339,13 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
 
                 let rect_constrained_loc = rect
                     .loc
-                    .constrain(Rectangle::from_extemities((0, 0), dest_size.to_point()));
+                    .constrain(Rectangle::from_extremities((0, 0), dest_size.to_point()));
                 let rect_clamped_size = rect.size.clamp(
                     (0, 0),
                     (dest_size.to_point() - rect_constrained_loc).to_size(),
                 );
 
-                let rect = Rectangle::from_loc_and_size(rect_constrained_loc, rect_clamped_size);
+                let rect = Rectangle::new(rect_constrained_loc, rect_clamped_size);
                 // Add the 4 f32s per damage rectangle for each of the 6 vertices.
                 (0..6).flat_map(move |_| {
                     [
@@ -392,7 +377,8 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
         let has_tint = frame.debug_flags().contains(DebugFlags::TINT);
 
         // render
-        frame.with_context(move |gl| -> Result<(), GlesError> {
+        let span_loc = smithay::gpu_span_location!("draw shader");
+        frame.with_profiled_context(span_loc, move |gl| -> Result<(), GlesError> {
             let program = if has_debug {
                 &shader.0.debug
             } else {
@@ -444,7 +430,7 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
                     gl.Uniform1f(shader.0.uniform_tint, tint);
                 }
 
-                for uniform in &self.additional_uniforms {
+                for uniform in &*self.additional_uniforms {
                     let desc =
                         program
                             .additional_uniforms
@@ -528,7 +514,7 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
         Ok(())
     }
 
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage> {
+    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
         // If scanout for things other than Wayland buffers is implemented, this will need to take
         // the target GPU into account.
         None
@@ -538,15 +524,16 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
 impl<'render> RenderElement<TtyRenderer<'render>> for ShaderRenderElement {
     fn draw(
         &self,
-        frame: &mut TtyFrame<'_, '_>,
+        frame: &mut TtyFrame<'_, '_, '_>,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
         let frame = frame.as_gles_frame();
 
-        RenderElement::<GlesRenderer>::draw(self, frame, src, dst, damage, opaque_regions)?;
+        RenderElement::<GlesRenderer>::draw(self, frame, src, dst, damage, opaque_regions, cache)?;
 
         Ok(())
     }
@@ -554,7 +541,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for ShaderRenderElement {
     fn underlying_storage(
         &self,
         _renderer: &mut TtyRenderer<'render>,
-    ) -> Option<UnderlyingStorage> {
+    ) -> Option<UnderlyingStorage<'_>> {
         // If scanout for things other than Wayland buffers is implemented, this will need to take
         // the target GPU into account.
         None

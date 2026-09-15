@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::iter::zip;
 use std::mem;
 
-use niri_config::FloatOrInt;
+use niri_config::{FloatOrInt, OutputName, Vrr};
 use niri_ipc::Transform;
 use smithay::reexports::wayland_protocols_wlr::output_management::v1::server::{
     zwlr_output_configuration_head_v1, zwlr_output_configuration_v1, zwlr_output_head_v1,
@@ -14,6 +14,7 @@ use smithay::reexports::wayland_server::protocol::wl_output::Transform as WlTran
 use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
 };
+use smithay::wayland::{Dispatch2, GlobalDispatch2};
 use zwlr_output_configuration_head_v1::ZwlrOutputConfigurationHeadV1;
 use zwlr_output_configuration_v1::ZwlrOutputConfigurationV1;
 use zwlr_output_head_v1::{AdaptiveSyncState, ZwlrOutputHeadV1};
@@ -22,6 +23,7 @@ use zwlr_output_mode_v1::ZwlrOutputModeV1;
 
 use crate::backend::OutputId;
 use crate::niri::State;
+use crate::protocols::EmptyData;
 use crate::utils::ipc_transform_to_smithay;
 
 const VERSION: u32 = 4;
@@ -50,6 +52,10 @@ pub trait OutputManagementHandler {
     fn apply_output_config(&mut self, config: niri_config::Outputs);
 }
 
+struct OutputConfigurationData {
+    serial: u32,
+}
+
 #[derive(Debug)]
 enum OutputConfigurationState {
     Ongoing(HashMap<OutputId, niri_config::Output>),
@@ -65,11 +71,6 @@ impl OutputManagementManagerState {
     pub fn new<D, F>(display: &DisplayHandle, filter: F) -> Self
     where
         D: GlobalDispatch<ZwlrOutputManagerV1, OutputManagementManagerGlobalData>,
-        D: Dispatch<ZwlrOutputManagerV1, ()>,
-        D: Dispatch<ZwlrOutputHeadV1, OutputId>,
-        D: Dispatch<ZwlrOutputConfigurationV1, u32>,
-        D: Dispatch<ZwlrOutputConfigurationHeadV1, OutputConfigurationHeadState>,
-        D: Dispatch<ZwlrOutputModeV1, ()>,
         D: OutputManagementHandler,
         D: 'static,
         F: for<'c> Fn(&'c Client) -> bool + Send + Sync + 'static,
@@ -110,19 +111,47 @@ impl OutputManagementManagerState {
                     }
                 }
 
-                // TTY outputs can't change modes I think, however, winit and virtual outputs can.
+                // Winit and virtual outputs can change modes; on a TTY custom modes can add/remove
+                // a mode.
                 let modes_changed = old.modes != conf.modes;
                 if modes_changed {
                     changed = true;
-                    if old.modes.len() != conf.modes.len() {
-                        error!("output's old mode count doesn't match new modes");
-                    } else {
-                        for client in self.clients.values() {
-                            if let Some((_, modes)) = client.heads.get(output) {
-                                for (wl_mode, mode) in zip(modes, &conf.modes) {
-                                    wl_mode.size(i32::from(mode.width), i32::from(mode.height));
-                                    if let Ok(refresh_rate) = mode.refresh_rate.try_into() {
-                                        wl_mode.refresh(refresh_rate);
+                    for client in self.clients.values_mut() {
+                        if let Some((head, modes)) = client.heads.get_mut(output) {
+                            // Ends on the shortest iterator.
+                            let zwlr_modes_with_modes = zip(modes.iter(), &conf.modes);
+                            let least_modes_len = zwlr_modes_with_modes.len();
+
+                            for (wl_mode, mode) in zwlr_modes_with_modes {
+                                wl_mode.size(i32::from(mode.width), i32::from(mode.height));
+                                if let Ok(refresh_rate) = mode.refresh_rate.try_into() {
+                                    wl_mode.refresh(refresh_rate);
+                                }
+                            }
+
+                            if let Some(client) = client.manager.client() {
+                                if conf.modes.len() > least_modes_len {
+                                    for mode in &conf.modes[least_modes_len..] {
+                                        // One or more modes were added.
+                                        let new_mode = client
+                                            .create_resource::<ZwlrOutputModeV1, _, State>(
+                                                &self.display,
+                                                head.version(),
+                                                EmptyData,
+                                            )
+                                            .unwrap();
+                                        head.mode(&new_mode);
+                                        new_mode
+                                            .size(i32::from(mode.width), i32::from(mode.height));
+                                        if let Ok(refresh_rate) = mode.refresh_rate.try_into() {
+                                            new_mode.refresh(refresh_rate)
+                                        }
+                                        modes.push(new_mode);
+                                    }
+                                } else if modes.len() > least_modes_len {
+                                    // One or more modes were removed.
+                                    for mode in modes.drain(least_modes_len..) {
+                                        mode.finished();
                                     }
                                 }
                             }
@@ -222,7 +251,7 @@ impl OutputManagementManagerState {
                 notify_new_head(self, output, conf);
             }
         }
-        for (old, _) in self.current_state.iter() {
+        for old in self.current_state.keys() {
             if !new_state.contains_key(old) {
                 changed = true;
                 notify_removed_head(&mut self.clients, old);
@@ -241,27 +270,23 @@ impl OutputManagementManagerState {
     }
 }
 
-impl<D> GlobalDispatch<ZwlrOutputManagerV1, OutputManagementManagerGlobalData, D>
-    for OutputManagementManagerState
+impl<D> GlobalDispatch2<ZwlrOutputManagerV1, D> for OutputManagementManagerGlobalData
 where
-    D: GlobalDispatch<ZwlrOutputManagerV1, OutputManagementManagerGlobalData>,
-    D: Dispatch<ZwlrOutputManagerV1, ()>,
+    D: Dispatch<ZwlrOutputManagerV1, EmptyData>,
+    D: Dispatch<ZwlrOutputModeV1, EmptyData>,
     D: Dispatch<ZwlrOutputHeadV1, OutputId>,
-    D: Dispatch<ZwlrOutputConfigurationV1, u32>,
-    D: Dispatch<ZwlrOutputConfigurationHeadV1, OutputConfigurationHeadState>,
-    D: Dispatch<ZwlrOutputModeV1, ()>,
     D: OutputManagementHandler,
     D: 'static,
 {
     fn bind(
+        &self,
         state: &mut D,
         display: &DisplayHandle,
         client: &Client,
         manager: New<ZwlrOutputManagerV1>,
-        _manager_state: &OutputManagementManagerGlobalData,
         data_init: &mut DataInit<'_, D>,
     ) {
-        let manager = data_init.init(manager, ());
+        let manager = data_init.init(manager, EmptyData);
         let g_state = state.output_management_state();
         let mut client_data = ClientData {
             heads: HashMap::new(),
@@ -275,35 +300,30 @@ where
         manager.done(g_state.serial);
     }
 
-    fn can_view(client: Client, global_data: &OutputManagementManagerGlobalData) -> bool {
-        (global_data.filter)(&client)
+    fn can_view(&self, client: &Client) -> bool {
+        (self.filter)(client)
     }
 }
 
-impl<D> Dispatch<ZwlrOutputManagerV1, (), D> for OutputManagementManagerState
+impl<D> Dispatch2<ZwlrOutputManagerV1, D> for EmptyData
 where
-    D: GlobalDispatch<ZwlrOutputManagerV1, OutputManagementManagerGlobalData>,
-    D: Dispatch<ZwlrOutputManagerV1, ()>,
-    D: Dispatch<ZwlrOutputHeadV1, OutputId>,
-    D: Dispatch<ZwlrOutputConfigurationV1, u32>,
-    D: Dispatch<ZwlrOutputConfigurationHeadV1, OutputConfigurationHeadState>,
-    D: Dispatch<ZwlrOutputModeV1, ()>,
+    D: Dispatch<ZwlrOutputConfigurationV1, OutputConfigurationData>,
     D: OutputManagementHandler,
     D: 'static,
 {
     fn request(
+        &self,
         state: &mut D,
         client: &Client,
         _manager: &ZwlrOutputManagerV1,
         request: zwlr_output_manager_v1::Request,
-        _data: &(),
         _display: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
     ) {
         match request {
             zwlr_output_manager_v1::Request::CreateConfiguration { id, serial } => {
                 let g_state = state.output_management_state();
-                let conf = data_init.init(id, serial);
+                let conf = data_init.init(id, OutputConfigurationData { serial });
                 if let Some(client_data) = g_state.clients.get_mut(&client.id()) {
                     if serial != g_state.serial {
                         conf.cancelled();
@@ -322,33 +342,28 @@ where
             _ => unreachable!(),
         }
     }
-    fn destroyed(state: &mut D, client: ClientId, _resource: &ZwlrOutputManagerV1, _data: &()) {
+    fn destroyed(&self, state: &mut D, client: ClientId, _resource: &ZwlrOutputManagerV1) {
         state.output_management_state().clients.remove(&client);
     }
 }
 
-impl<D> Dispatch<ZwlrOutputConfigurationV1, u32, D> for OutputManagementManagerState
+impl<D> Dispatch2<ZwlrOutputConfigurationV1, D> for OutputConfigurationData
 where
-    D: GlobalDispatch<ZwlrOutputManagerV1, OutputManagementManagerGlobalData>,
-    D: Dispatch<ZwlrOutputManagerV1, ()>,
-    D: Dispatch<ZwlrOutputHeadV1, OutputId>,
-    D: Dispatch<ZwlrOutputConfigurationV1, u32>,
     D: Dispatch<ZwlrOutputConfigurationHeadV1, OutputConfigurationHeadState>,
-    D: Dispatch<ZwlrOutputModeV1, ()>,
     D: OutputManagementHandler,
     D: 'static,
 {
     fn request(
+        &self,
         state: &mut D,
         client: &Client,
         conf: &ZwlrOutputConfigurationV1,
         request: zwlr_output_configuration_v1::Request,
-        serial: &u32,
         _display: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
     ) {
         let g_state = state.output_management_state();
-        let outdated = *serial != g_state.serial;
+        let outdated = self.serial != g_state.serial;
         if outdated {
             debug!("OutputConfiguration: request from an outdated configuration");
         }
@@ -403,12 +418,13 @@ where
                         return;
                     }
                     Entry::Vacant(entry) => {
+                        let name = OutputName::from_ipc_output(current_config);
                         let mut config = g_state
                             .current_config
-                            .find(&current_config.name)
+                            .find(&name)
                             .cloned()
                             .unwrap_or_else(|| niri_config::Output {
-                                name: current_config.name.clone(),
+                                name: name.format_make_model_serial_or_connector(),
                                 ..Default::default()
                             });
                         config.off = false;
@@ -452,12 +468,13 @@ where
                         );
                     }
                     Entry::Vacant(entry) => {
+                        let name = OutputName::from_ipc_output(current_config);
                         let mut config = g_state
                             .current_config
-                            .find(&current_config.name)
+                            .find(&name)
                             .cloned()
                             .unwrap_or_else(|| niri_config::Output {
-                                name: current_config.name.clone(),
+                                name: name.format_make_model_serial_or_connector(),
                                 ..Default::default()
                             });
                         config.off = true;
@@ -535,24 +552,17 @@ where
     }
 }
 
-impl<D> Dispatch<ZwlrOutputConfigurationHeadV1, OutputConfigurationHeadState, D>
-    for OutputManagementManagerState
+impl<D> Dispatch2<ZwlrOutputConfigurationHeadV1, D> for OutputConfigurationHeadState
 where
-    D: GlobalDispatch<ZwlrOutputManagerV1, OutputManagementManagerGlobalData>,
-    D: Dispatch<ZwlrOutputManagerV1, ()>,
-    D: Dispatch<ZwlrOutputHeadV1, OutputId>,
-    D: Dispatch<ZwlrOutputConfigurationV1, u32>,
-    D: Dispatch<ZwlrOutputConfigurationHeadV1, OutputConfigurationHeadState>,
-    D: Dispatch<ZwlrOutputModeV1, ()>,
     D: OutputManagementHandler,
     D: 'static,
 {
     fn request(
+        &self,
         state: &mut D,
         client: &Client,
         conf_head: &ZwlrOutputConfigurationHeadV1,
         request: zwlr_output_configuration_head_v1::Request,
-        data: &OutputConfigurationHeadState,
         _display: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
@@ -561,11 +571,12 @@ where
             error!("ConfigurationHead: missing client data");
             return;
         };
-        let OutputConfigurationHeadState::Ok(output_id, conf) = data else {
+        let OutputConfigurationHeadState::Ok(output_id, conf) = self else {
             warn!("ConfigurationHead: request sent to a cancelled head");
             return;
         };
-        let Some(serial) = conf.data::<u32>() else {
+        let Some(OutputConfigurationData { serial }) = conf.data::<OutputConfigurationData>()
+        else {
             error!("ConfigurationHead: missing serial");
             return;
         };
@@ -617,18 +628,21 @@ where
                     return;
                 };
 
-                new_config.mode = Some(niri_ipc::ConfiguredMode {
-                    width: mode.width,
-                    height: mode.height,
-                    refresh: Some(mode.refresh_rate as f64 / 1000.),
+                new_config.mode = Some(niri_config::output::Mode {
+                    custom: false,
+                    mode: niri_ipc::ConfiguredMode {
+                        width: mode.width,
+                        height: mode.height,
+                        refresh: Some(mode.refresh_rate as f64 / 1000.),
+                    },
                 });
+                new_config.modeline = None;
             }
             zwlr_output_configuration_head_v1::Request::SetCustomMode {
                 width,
                 height,
                 refresh,
             } => {
-                // FIXME: Support custom mode
                 let (width, height, refresh): (u16, u16, u32) =
                     match (width.try_into(), height.try_into(), refresh.try_into()) {
                         (Ok(width), Ok(height), Ok(refresh)) => (width, height, refresh),
@@ -638,25 +652,20 @@ where
                         }
                     };
 
-                let Some(current_config) = g_state.current_state.get(output_id) else {
-                    warn!("SetMode: output missing from the current config");
+                if refresh == 0 {
+                    warn!("SetCustomMode: refresh 0 requested, ignoring");
                     return;
-                };
+                }
 
-                let Some(mode) = current_config.modes.iter().find(|m| {
-                    m.width == width
-                        && m.height == height
-                        && (refresh == 0 || m.refresh_rate == refresh)
-                }) else {
-                    warn!("SetCustomMode: no matching mode");
-                    return;
-                };
-
-                new_config.mode = Some(niri_ipc::ConfiguredMode {
-                    width: mode.width,
-                    height: mode.height,
-                    refresh: Some(mode.refresh_rate as f64 / 1000.),
+                new_config.mode = Some(niri_config::output::Mode {
+                    custom: true,
+                    mode: niri_ipc::ConfiguredMode {
+                        width,
+                        height,
+                        refresh: Some(refresh as f64 / 1000.),
+                    },
                 });
+                new_config.modeline = None;
             }
             zwlr_output_configuration_head_v1::Request::SetPosition { x, y } => {
                 new_config.position = Some(niri_config::Position { x, y });
@@ -693,9 +702,9 @@ where
                 new_config.scale = Some(FloatOrInt(scale));
             }
             zwlr_output_configuration_head_v1::Request::SetAdaptiveSync { state } => {
-                let enabled = match state {
-                    WEnum::Value(AdaptiveSyncState::Enabled) => true,
-                    WEnum::Value(AdaptiveSyncState::Disabled) => false,
+                let vrr = match state {
+                    WEnum::Value(AdaptiveSyncState::Enabled) => Some(Vrr { on_demand: false }),
+                    WEnum::Value(AdaptiveSyncState::Disabled) => None,
                     _ => {
                         warn!("SetAdaptativeSync: unknown requested adaptative sync");
                         conf_head.post_error(
@@ -705,30 +714,24 @@ where
                         return;
                     }
                 };
-                new_config.variable_refresh_rate = enabled;
+                new_config.variable_refresh_rate = vrr;
             }
             _ => unreachable!(),
         }
     }
 }
 
-impl<D> Dispatch<ZwlrOutputHeadV1, OutputId, D> for OutputManagementManagerState
+impl<D> Dispatch2<ZwlrOutputHeadV1, D> for OutputId
 where
-    D: GlobalDispatch<ZwlrOutputManagerV1, OutputManagementManagerGlobalData>,
-    D: Dispatch<ZwlrOutputManagerV1, ()>,
-    D: Dispatch<ZwlrOutputHeadV1, OutputId>,
-    D: Dispatch<ZwlrOutputConfigurationV1, u32>,
-    D: Dispatch<ZwlrOutputConfigurationHeadV1, OutputConfigurationHeadState>,
-    D: Dispatch<ZwlrOutputModeV1, ()>,
     D: OutputManagementHandler,
     D: 'static,
 {
     fn request(
+        &self,
         _state: &mut D,
         _client: &Client,
         _output_head: &ZwlrOutputHeadV1,
         request: zwlr_output_head_v1::Request,
-        _data: &OutputId,
         _display: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
@@ -737,30 +740,24 @@ where
             _ => unreachable!(),
         }
     }
-    fn destroyed(state: &mut D, client: ClientId, _resource: &ZwlrOutputHeadV1, data: &OutputId) {
+    fn destroyed(&self, state: &mut D, client: ClientId, _resource: &ZwlrOutputHeadV1) {
         if let Some(c) = state.output_management_state().clients.get_mut(&client) {
-            c.heads.remove(data);
+            c.heads.remove(self);
         }
     }
 }
 
-impl<D> Dispatch<ZwlrOutputModeV1, (), D> for OutputManagementManagerState
+impl<D> Dispatch2<ZwlrOutputModeV1, D> for EmptyData
 where
-    D: GlobalDispatch<ZwlrOutputManagerV1, OutputManagementManagerGlobalData>,
-    D: Dispatch<ZwlrOutputManagerV1, ()>,
-    D: Dispatch<ZwlrOutputHeadV1, OutputId>,
-    D: Dispatch<ZwlrOutputConfigurationV1, u32>,
-    D: Dispatch<ZwlrOutputConfigurationHeadV1, OutputConfigurationHeadState>,
-    D: Dispatch<ZwlrOutputModeV1, ()>,
     D: OutputManagementHandler,
     D: 'static,
 {
     fn request(
+        &self,
         _state: &mut D,
         _client: &Client,
         _mode: &ZwlrOutputModeV1,
         request: zwlr_output_mode_v1::Request,
-        _data: &(),
         _display: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
@@ -769,30 +766,6 @@ where
             _ => unreachable!(),
         }
     }
-}
-
-#[macro_export]
-macro_rules! delegate_output_management{
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        smithay::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            smithay::reexports::wayland_protocols_wlr::output_management::v1::server::zwlr_output_manager_v1::ZwlrOutputManagerV1: $crate::protocols::output_management::OutputManagementManagerGlobalData
-        ] => $crate::protocols::output_management::OutputManagementManagerState);
-        smithay::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            smithay::reexports::wayland_protocols_wlr::output_management::v1::server::zwlr_output_manager_v1::ZwlrOutputManagerV1: ()
-        ] => $crate::protocols::output_management::OutputManagementManagerState);
-        smithay::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            smithay::reexports::wayland_protocols_wlr::output_management::v1::server::zwlr_output_configuration_v1::ZwlrOutputConfigurationV1: u32
-        ] => $crate::protocols::output_management::OutputManagementManagerState);
-        smithay::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            smithay::reexports::wayland_protocols_wlr::output_management::v1::server::zwlr_output_head_v1::ZwlrOutputHeadV1: $crate::backend::OutputId
-        ] => $crate::protocols::output_management::OutputManagementManagerState);
-        smithay::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            smithay::reexports::wayland_protocols_wlr::output_management::v1::server::zwlr_output_mode_v1::ZwlrOutputModeV1: ()
-        ] => $crate::protocols::output_management::OutputManagementManagerState);
-        smithay::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            smithay::reexports::wayland_protocols_wlr::output_management::v1::server::zwlr_output_configuration_head_v1::ZwlrOutputConfigurationHeadV1: $crate::protocols::output_management::OutputConfigurationHeadState
-        ] => $crate::protocols::output_management::OutputManagementManagerState);
-    };
 }
 
 fn notify_removed_head(clients: &mut HashMap<ClientId, ClientData>, head: &OutputId) {
@@ -825,15 +798,9 @@ fn send_new_head<D>(
     output: OutputId,
     conf: &niri_ipc::Output,
 ) where
-    D: GlobalDispatch<ZwlrOutputManagerV1, OutputManagementManagerGlobalData>,
-    D: Dispatch<ZwlrOutputManagerV1, ()>,
-    D: Dispatch<ZwlrOutputConfigurationV1, u32>,
-    D: Dispatch<ZwlrOutputConfigurationHeadV1, OutputConfigurationHeadState>,
-    D: Dispatch<ZwlrOutputModeV1, ()>,
-    D: OutputManagementHandler,
-    D: 'static,
+    D: Dispatch<ZwlrOutputModeV1, EmptyData>,
     D: Dispatch<ZwlrOutputHeadV1, OutputId>,
-    D: Dispatch<ZwlrOutputModeV1, ()>,
+    D: OutputManagementHandler,
     D: 'static,
 {
     let new_head = client
@@ -841,6 +808,7 @@ fn send_new_head<D>(
         .unwrap();
     client_data.manager.head(&new_head);
     new_head.name(conf.name.clone());
+    // Format matches what Output::new() does internally.
     new_head.description(format!("{} - {} - {}", conf.make, conf.model, conf.name));
     if let Some((width, height)) = conf.physical_size {
         if let (Ok(a), Ok(b)) = (width.try_into(), height.try_into()) {
@@ -850,7 +818,7 @@ fn send_new_head<D>(
     let mut new_modes = Vec::with_capacity(conf.modes.len());
     for (index, mode) in conf.modes.iter().enumerate() {
         let new_mode = client
-            .create_resource::<ZwlrOutputModeV1, _, D>(display, new_head.version(), ())
+            .create_resource::<ZwlrOutputModeV1, _, D>(display, new_head.version(), EmptyData)
             .unwrap();
         new_head.mode(&new_mode);
         new_mode.size(i32::from(mode.width), i32::from(mode.height));
@@ -876,6 +844,11 @@ fn send_new_head<D>(
     }
     if new_head.version() >= zwlr_output_head_v1::EVT_MODEL_SINCE {
         new_head.model(conf.model.clone());
+    }
+    if new_head.version() >= zwlr_output_head_v1::EVT_SERIAL_NUMBER_SINCE {
+        if let Some(serial) = &conf.serial {
+            new_head.serial_number(serial.clone());
+        }
     }
 
     if new_head.version() >= zwlr_output_head_v1::EVT_ADAPTIVE_SYNC_SINCE {

@@ -1,10 +1,11 @@
 use std::cell::RefCell;
 use std::cmp::max;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::iter::zip;
 use std::rc::Rc;
 
-use niri_config::{Action, Config, Key, Modifiers, Trigger};
+use niri_config::{Action, Bind, Config, Key, ModKey, Modifiers, Trigger};
 use pangocairo::cairo::{self, ImageSurface};
 use pangocairo::pango::{AttrColor, AttrInt, AttrList, AttrString, FontDescription, Weight};
 use smithay::backend::renderer::element::Kind;
@@ -14,7 +15,6 @@ use smithay::output::{Output, WeakOutput};
 use smithay::reexports::gbm::Format as Fourcc;
 use smithay::utils::{Scale, Transform};
 
-use crate::input::CompositorMod;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -30,7 +30,7 @@ const TITLE: &str = "Important Hotkeys";
 pub struct HotkeyOverlay {
     is_open: bool,
     config: Rc<RefCell<Config>>,
-    comp_mod: CompositorMod,
+    mod_key: ModKey,
     buffers: RefCell<HashMap<WeakOutput, RenderedOverlay>>,
 }
 
@@ -39,11 +39,11 @@ pub struct RenderedOverlay {
 }
 
 impl HotkeyOverlay {
-    pub fn new(config: Rc<RefCell<Config>>, comp_mod: CompositorMod) -> Self {
+    pub fn new(config: Rc<RefCell<Config>>, mod_key: ModKey) -> Self {
         Self {
             is_open: false,
             config,
-            comp_mod,
+            mod_key,
             buffers: RefCell::new(HashMap::new()),
         }
     }
@@ -70,7 +70,8 @@ impl HotkeyOverlay {
         self.is_open
     }
 
-    pub fn on_hotkey_config_updated(&mut self) {
+    pub fn on_hotkey_config_updated(&mut self, mod_key: ModKey) {
+        self.mod_key = mod_key;
         self.buffers.borrow_mut().clear();
     }
 
@@ -101,7 +102,7 @@ impl HotkeyOverlay {
 
         let rendered = buffers.entry(weak).or_insert_with(|| {
             let renderer = renderer.as_gles_renderer();
-            render(renderer, &self.config.borrow(), self.comp_mod, scale)
+            render(renderer, &self.config.borrow(), self.mod_key, scale)
                 .unwrap_or_else(|_| RenderedOverlay { buffer: None })
         });
         let buffer = rendered.buffer.as_ref()?;
@@ -123,26 +124,77 @@ impl HotkeyOverlay {
 
         Some(PrimaryGpuTextureRenderElement(elem))
     }
+
+    pub fn a11y_text(&self) -> String {
+        let config = self.config.borrow();
+        let actions = collect_actions(&config);
+
+        let mut buf = String::new();
+        writeln!(&mut buf, "{TITLE}").unwrap();
+
+        for action in actions {
+            let Some((key, action)) = format_bind(&config.binds.0, action) else {
+                continue;
+            };
+
+            let key = key.map(|key| key_name(true, self.mod_key, &key));
+            let key = key.as_deref().unwrap_or("not bound");
+
+            let action = match pango::parse_markup(&action, '\0') {
+                Ok((_attrs, text, _accel)) => text,
+                Err(_) => action.into(),
+            };
+
+            writeln!(&mut buf, "{key} {action}").unwrap();
+        }
+
+        buf
+    }
 }
 
-fn render(
-    renderer: &mut GlesRenderer,
-    config: &Config,
-    comp_mod: CompositorMod,
-    scale: f64,
-) -> anyhow::Result<RenderedOverlay> {
-    let _span = tracy_client::span!("hotkey_overlay::render");
+fn format_bind(binds: &[Bind], action: &Action) -> Option<(Option<Key>, String)> {
+    let mut bind_with_non_null = None;
+    let mut bind_with_custom_title = None;
+    let mut found_null_title = false;
 
-    // let margin = MARGIN * scale;
-    let padding: i32 = to_physical_precise_round(scale, PADDING);
-    let line_interval: i32 = to_physical_precise_round(scale, LINE_INTERVAL);
+    for bind in binds {
+        if bind.action != *action {
+            continue;
+        }
 
-    // FIXME: if it doesn't fit, try splitting in two columns or something.
-    // let mut target_size = output_size;
-    // target_size.w -= margin * 2;
-    // target_size.h -= margin * 2;
-    // anyhow::ensure!(target_size.w > 0 && target_size.h > 0);
+        match &bind.hotkey_overlay_title {
+            Some(Some(_)) => {
+                bind_with_custom_title.get_or_insert(bind);
+            }
+            Some(None) => {
+                found_null_title = true;
+            }
+            None => {
+                bind_with_non_null.get_or_insert(bind);
+            }
+        }
+    }
 
+    if bind_with_custom_title.is_none() && found_null_title {
+        return None;
+    }
+
+    let mut title = None;
+    let key = if let Some(bind) = bind_with_custom_title.or(bind_with_non_null) {
+        if let Some(Some(custom)) = &bind.hotkey_overlay_title {
+            title = Some(custom.clone());
+        }
+
+        Some(bind.key)
+    } else {
+        None
+    };
+    let title = title.unwrap_or_else(|| action_name(action));
+
+    Some((key, title))
+}
+
+fn collect_actions(config: &Config) -> Vec<&Action> {
     let binds = &config.binds.0;
 
     // Collect actions that we want to show.
@@ -169,51 +221,66 @@ fn render(
     ]);
 
     // Prefer move-column-to-workspace-down, but fall back to move-window-to-workspace-down.
-    if binds
+    if let Some(bind) = binds
         .iter()
-        .any(|bind| bind.action == Action::MoveColumnToWorkspaceDown)
+        .find(|bind| matches!(bind.action, Action::MoveColumnToWorkspaceDown(_)))
     {
-        actions.push(&Action::MoveColumnToWorkspaceDown);
+        actions.push(&bind.action);
     } else if binds
         .iter()
-        .any(|bind| bind.action == Action::MoveWindowToWorkspaceDown)
+        .any(|bind| matches!(bind.action, Action::MoveWindowToWorkspaceDown(_)))
     {
-        actions.push(&Action::MoveWindowToWorkspaceDown);
+        actions.push(&Action::MoveWindowToWorkspaceDown(true));
     } else {
-        actions.push(&Action::MoveColumnToWorkspaceDown);
+        actions.push(&Action::MoveColumnToWorkspaceDown(true));
     }
 
     // Same for -up.
-    if binds
+    if let Some(bind) = binds
         .iter()
-        .any(|bind| bind.action == Action::MoveColumnToWorkspaceUp)
+        .find(|bind| matches!(bind.action, Action::MoveColumnToWorkspaceUp(_)))
     {
-        actions.push(&Action::MoveColumnToWorkspaceUp);
+        actions.push(&bind.action);
     } else if binds
         .iter()
-        .any(|bind| bind.action == Action::MoveWindowToWorkspaceUp)
+        .any(|bind| matches!(bind.action, Action::MoveWindowToWorkspaceUp(_)))
     {
-        actions.push(&Action::MoveWindowToWorkspaceUp);
+        actions.push(&Action::MoveWindowToWorkspaceUp(true));
     } else {
-        actions.push(&Action::MoveColumnToWorkspaceUp);
+        actions.push(&Action::MoveColumnToWorkspaceUp(true));
     }
 
     actions.extend(&[
         &Action::SwitchPresetColumnWidth,
         &Action::MaximizeColumn,
-        &Action::ConsumeWindowIntoColumn,
-        &Action::ExpelWindowFromColumn,
+        &Action::ConsumeOrExpelWindowLeft,
+        &Action::ConsumeOrExpelWindowRight,
+        &Action::ToggleWindowFloating,
+        &Action::SwitchFocusBetweenFloatingAndTiling,
+        &Action::ToggleOverview,
     ]);
 
     // Screenshot is not as important, can omit if not bound.
-    if binds.iter().any(|bind| bind.action == Action::Screenshot) {
-        actions.push(&Action::Screenshot);
+    if let Some(bind) = binds
+        .iter()
+        .find(|bind| matches!(bind.action, Action::Screenshot(_, _)))
+    {
+        actions.push(&bind.action);
+    }
+
+    // Add actions with a custom hotkey-overlay-title.
+    for bind in binds {
+        if matches!(bind.hotkey_overlay_title, Some(Some(_))) {
+            // Avoid duplicate actions.
+            if !actions.contains(&&bind.action) {
+                actions.push(&bind.action);
+            }
+        }
     }
 
     // Add the spawn actions.
-    let mut spawn_actions = Vec::new();
     for bind in binds.iter().filter(|bind| {
-        matches!(bind.action, Action::Spawn(_))
+        matches!(bind.action, Action::Spawn(_) | Action::SpawnSh(_))
             // Only show binds with Mod or Super to filter out stuff like volume up/down.
             && (bind.key.modifiers.contains(Modifiers::COMPOSITOR)
                 || bind.key.modifiers.contains(Modifiers::SUPER))
@@ -223,24 +290,45 @@ fn render(
         let action = &bind.action;
 
         // We only show one bind for each action, so we need to deduplicate the Spawn actions.
-        if !spawn_actions.contains(&action) {
-            spawn_actions.push(action);
+        if !actions.contains(&action) {
+            actions.push(action);
         }
     }
-    actions.extend(spawn_actions);
 
-    let strings = actions
+    if config.hotkey_overlay.hide_not_bound {
+        // Only keep actions that have been bound
+        actions.retain(|&action| binds.iter().any(|bind| bind.action == *action))
+    }
+
+    actions
+}
+
+fn render(
+    renderer: &mut GlesRenderer,
+    config: &Config,
+    mod_key: ModKey,
+    scale: f64,
+) -> anyhow::Result<RenderedOverlay> {
+    let _span = tracy_client::span!("hotkey_overlay::render");
+
+    // let margin = MARGIN * scale;
+    let padding: i32 = to_physical_precise_round(scale, PADDING);
+    let line_interval: i32 = to_physical_precise_round(scale, LINE_INTERVAL);
+
+    // FIXME: if it doesn't fit, try splitting in two columns or something.
+    // let mut target_size = output_size;
+    // target_size.w -= margin * 2;
+    // target_size.h -= margin * 2;
+    // anyhow::ensure!(target_size.w > 0 && target_size.h > 0);
+
+    let strings = collect_actions(config)
         .into_iter()
-        .map(|action| {
-            let key = config
-                .binds
-                .0
-                .iter()
-                .find(|bind| bind.action == *action)
-                .map(|bind| key_name(comp_mod, &bind.key))
-                .unwrap_or_else(|| String::from("(not bound)"));
-
-            (format!(" {key} "), action_name(action))
+        .filter_map(|action| format_bind(&config.binds.0, action))
+        .map(|(key, action)| {
+            let key = key.map(|key| key_name(false, mod_key, &key));
+            let key = key.as_deref().unwrap_or("(not bound)");
+            let key = format!(" {key} ");
+            (key, action)
         })
         .collect::<Vec<_>>();
 
@@ -321,8 +409,16 @@ fn render(
 
         cr.rel_move_to((key_width + padding).into(), 0.);
 
-        layout.set_attributes(None);
-        layout.set_markup(action);
+        let (attrs, text) = match pango::parse_markup(action, '\0') {
+            Ok((attrs, text, _accel)) => (Some(attrs), text),
+            Err(err) => {
+                warn!("error parsing markup for key {key}: {err}");
+                (None, action.into())
+            }
+        };
+
+        layout.set_attributes(attrs.as_ref());
+        layout.set_text(&text);
         pangocairo::functions::show_layout(&cr, &layout);
 
         cr.rel_move_to(
@@ -370,48 +466,92 @@ fn action_name(action: &Action) -> String {
         Action::MoveColumnRight => String::from("Move Column Right"),
         Action::FocusWorkspaceDown => String::from("Switch Workspace Down"),
         Action::FocusWorkspaceUp => String::from("Switch Workspace Up"),
-        Action::MoveColumnToWorkspaceDown => String::from("Move Column to Workspace Down"),
-        Action::MoveColumnToWorkspaceUp => String::from("Move Column to Workspace Up"),
-        Action::MoveWindowToWorkspaceDown => String::from("Move Window to Workspace Down"),
-        Action::MoveWindowToWorkspaceUp => String::from("Move Window to Workspace Up"),
+        Action::MoveColumnToWorkspaceDown(_) => String::from("Move Column to Workspace Down"),
+        Action::MoveColumnToWorkspaceUp(_) => String::from("Move Column to Workspace Up"),
+        Action::MoveWindowToWorkspaceDown(_) => String::from("Move Window to Workspace Down"),
+        Action::MoveWindowToWorkspaceUp(_) => String::from("Move Window to Workspace Up"),
         Action::SwitchPresetColumnWidth => String::from("Switch Preset Column Widths"),
         Action::MaximizeColumn => String::from("Maximize Column"),
-        Action::ConsumeWindowIntoColumn => String::from("Consume Window Into Column"),
-        Action::ExpelWindowFromColumn => String::from("Expel Window From Column"),
-        Action::Screenshot => String::from("Take a Screenshot"),
+        Action::ConsumeOrExpelWindowLeft => String::from("Consume or Expel Window Left"),
+        Action::ConsumeOrExpelWindowRight => String::from("Consume or Expel Window Right"),
+        Action::ToggleWindowFloating => String::from("Move Window Between Floating and Tiling"),
+        Action::SwitchFocusBetweenFloatingAndTiling => {
+            String::from("Switch Focus Between Floating and Tiling")
+        }
+        Action::ToggleOverview => String::from("Open the Overview"),
+        Action::Screenshot(_, _) => String::from("Take a Screenshot"),
         Action::Spawn(args) => format!(
             "Spawn <span face='monospace' bgcolor='#000000'>{}</span>",
             args.first().unwrap_or(&String::new())
+        ),
+        Action::SpawnSh(command) => format!(
+            "Spawn <span face='monospace' bgcolor='#000000'>{}</span>",
+            // Fairly crude but should get the job done in most cases.
+            command.split_ascii_whitespace().next().unwrap_or("")
         ),
         _ => String::from("FIXME: Unknown"),
     }
 }
 
-fn key_name(comp_mod: CompositorMod, key: &Key) -> String {
+fn key_name(screen_reader: bool, mod_key: ModKey, key: &Key) -> String {
     let mut name = String::new();
 
     let has_comp_mod = key.modifiers.contains(Modifiers::COMPOSITOR);
 
-    if key.modifiers.contains(Modifiers::SUPER)
-        || (has_comp_mod && comp_mod == CompositorMod::Super)
-    {
+    // Compositor mod goes first.
+    if has_comp_mod {
+        match mod_key {
+            ModKey::Super => {
+                name.push_str("Super + ");
+            }
+            ModKey::Alt => {
+                name.push_str("Alt + ");
+            }
+            ModKey::Shift => {
+                name.push_str("Shift + ");
+            }
+            ModKey::Ctrl => {
+                name.push_str("Ctrl + ");
+            }
+            ModKey::IsoLevel3Shift => {
+                name.push_str("Mod5 + ");
+            }
+            ModKey::IsoLevel5Shift => {
+                name.push_str("Mod3 + ");
+            }
+        }
+    }
+
+    if key.modifiers.contains(Modifiers::SUPER) && !(has_comp_mod && mod_key == ModKey::Super) {
         name.push_str("Super + ");
     }
-    if key.modifiers.contains(Modifiers::ALT) || (has_comp_mod && comp_mod == CompositorMod::Alt) {
-        name.push_str("Alt + ");
+    if key.modifiers.contains(Modifiers::CTRL) && !(has_comp_mod && mod_key == ModKey::Ctrl) {
+        name.push_str("Ctrl + ");
     }
-    if key.modifiers.contains(Modifiers::ISO_LEVEL3_SHIFT) {
-        name.push_str("ISO_Level3_Shift + ");
-    }
-    if key.modifiers.contains(Modifiers::SHIFT) {
+    if key.modifiers.contains(Modifiers::SHIFT) && !(has_comp_mod && mod_key == ModKey::Shift) {
         name.push_str("Shift + ");
     }
-    if key.modifiers.contains(Modifiers::CTRL) {
-        name.push_str("Ctrl + ");
+    if key.modifiers.contains(Modifiers::ALT) && !(has_comp_mod && mod_key == ModKey::Alt) {
+        name.push_str("Alt + ");
+    }
+    if key.modifiers.contains(Modifiers::ISO_LEVEL3_SHIFT)
+        && !(has_comp_mod && mod_key == ModKey::IsoLevel3Shift)
+    {
+        name.push_str("Mod5 + ");
+    }
+    if key.modifiers.contains(Modifiers::ISO_LEVEL5_SHIFT)
+        && !(has_comp_mod && mod_key == ModKey::IsoLevel5Shift)
+    {
+        name.push_str("Mod3 + ");
     }
 
     let pretty = match key.trigger {
-        Trigger::Keysym(keysym) => prettify_keysym_name(&keysym_get_name(keysym)),
+        Trigger::Keysym(keysym) => prettify_keysym_name(screen_reader, &keysym_get_name(keysym)),
+        Trigger::MouseLeft => String::from("Mouse Left"),
+        Trigger::MouseRight => String::from("Mouse Right"),
+        Trigger::MouseMiddle => String::from("Mouse Middle"),
+        Trigger::MouseBack => String::from("Mouse Back"),
+        Trigger::MouseForward => String::from("Mouse Forward"),
         Trigger::WheelScrollDown => String::from("Wheel Scroll Down"),
         Trigger::WheelScrollUp => String::from("Wheel Scroll Up"),
         Trigger::WheelScrollLeft => String::from("Wheel Scroll Left"),
@@ -420,24 +560,45 @@ fn key_name(comp_mod: CompositorMod, key: &Key) -> String {
         Trigger::TouchpadScrollUp => String::from("Touchpad Scroll Up"),
         Trigger::TouchpadScrollLeft => String::from("Touchpad Scroll Left"),
         Trigger::TouchpadScrollRight => String::from("Touchpad Scroll Right"),
+        Trigger::TabletStylusButton1 => String::from("Tablet Stylus Button 1"),
+        Trigger::TabletStylusButton2 => String::from("Tablet Stylus Button 2"),
+        Trigger::TabletStylusButton3 => String::from("Tablet Stylus Button 3"),
     };
     name.push_str(&pretty);
 
     name
 }
 
-fn prettify_keysym_name(name: &str) -> String {
+fn prettify_keysym_name(screen_reader: bool, name: &str) -> String {
+    let name = if screen_reader {
+        name
+    } else {
+        match name {
+            "slash" => "/",
+            "comma" => ",",
+            "period" => ".",
+            "minus" => "-",
+            "equal" => "=",
+            "grave" => "`",
+            "bracketleft" => "[",
+            "bracketright" => "]",
+            "adiaeresis" => "Ä",
+            "ediaeresis" => "Ë",
+            "idiaeresis" => "Ï",
+            "odiaeresis" => "Ö",
+            "udiaeresis" => "Ü",
+            "ydiaeresis" => "Ÿ",
+            "wdiaeresis" => "Ẅ",
+            _ => name,
+        }
+    };
+
     let name = match name {
-        "slash" => "/",
-        "comma" => ",",
-        "period" => ".",
-        "minus" => "-",
-        "equal" => "=",
-        "grave" => "`",
         "Next" => "Page Down",
         "Prior" => "Page Up",
         "Print" => "PrtSc",
         "Return" => "Enter",
+        "space" => "Space",
         _ => name,
     };
 
@@ -445,5 +606,112 @@ fn prettify_keysym_name(name: &str) -> String {
         name.to_ascii_uppercase()
     } else {
         name.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use insta::assert_snapshot;
+
+    use super::*;
+
+    #[track_caller]
+    fn check(config: &str, action: Action) -> String {
+        let config = Config::parse_mem(config).unwrap();
+        if let Some((key, title)) = format_bind(&config.binds.0, &action) {
+            let key = key.map(|key| key_name(false, ModKey::Super, &key));
+            let key = key.as_deref().unwrap_or("(not bound)");
+            format!(" {key} : {title}")
+        } else {
+            String::from("None")
+        }
+    }
+
+    #[test]
+    fn test_format_bind() {
+        // Not bound.
+        assert_snapshot!(check("", Action::Screenshot(true, None)), @" (not bound) : Take a Screenshot");
+
+        // Bound with a default title.
+        assert_snapshot!(
+            check(
+                r#"binds {
+                    Mod+P { screenshot; }
+                }"#,
+                Action::Screenshot(true, None),
+            ),
+            @" Super + P : Take a Screenshot"
+        );
+
+        // Custom title.
+        assert_snapshot!(
+            check(
+                r#"binds {
+                    Mod+P hotkey-overlay-title="Hello" { screenshot; }
+                }"#,
+                Action::Screenshot(true, None),
+            ),
+            @" Super + P : Hello"
+        );
+
+        // Prefer first bind.
+        assert_snapshot!(
+            check(
+                r#"binds {
+                    Mod+P { screenshot; }
+                    Print { screenshot; }
+                }"#,
+                Action::Screenshot(true, None),
+            ),
+            @" Super + P : Take a Screenshot"
+        );
+
+        // Prefer bind with custom title.
+        assert_snapshot!(
+            check(
+                r#"binds {
+                    Mod+P { screenshot; }
+                    Print hotkey-overlay-title="My Cool Bind" { screenshot; }
+                }"#,
+                Action::Screenshot(true, None),
+            ),
+            @" PrtSc : My Cool Bind"
+        );
+
+        // Prefer first bind with custom title.
+        assert_snapshot!(
+            check(
+                r#"binds {
+                    Mod+P hotkey-overlay-title="First" { screenshot; }
+                    Print hotkey-overlay-title="My Cool Bind" { screenshot; }
+                }"#,
+                Action::Screenshot(true, None),
+            ),
+            @" Super + P : First"
+        );
+
+        // Any bind with null title hides it.
+        assert_snapshot!(
+            check(
+                r#"binds {
+                    Mod+P { screenshot; }
+                    Print hotkey-overlay-title=null { screenshot; }
+                }"#,
+                Action::Screenshot(true, None),
+            ),
+            @"None"
+        );
+
+        // Custom title takes preference over null.
+        assert_snapshot!(
+            check(
+                r#"binds {
+                    Mod+P hotkey-overlay-title="Hello" { screenshot; }
+                    Print hotkey-overlay-title=null { screenshot; }
+                }"#,
+                Action::Screenshot(true, None),
+            ),
+            @" Super + P : Hello"
+        );
     }
 }

@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use clap_complete::Shell;
 use niri_ipc::{Action, OutputAction};
 
 use crate::utils::version;
@@ -42,6 +43,9 @@ pub enum Sub {
         /// Format output as JSON.
         #[arg(short, long)]
         json: bool,
+        /// Print the IPC request as JSON instead of sending it.
+        #[arg(long)]
+        print_request: bool,
     },
     /// Validate the config file.
     Validate {
@@ -54,6 +58,8 @@ pub enum Sub {
     },
     /// Cause a panic to check if the backtraces are good.
     Panic,
+    /// Generate shell completions.
+    Completions { shell: CompletionShell },
 }
 
 #[derive(Subcommand)]
@@ -62,10 +68,20 @@ pub enum Msg {
     Outputs,
     /// List workspaces.
     Workspaces,
-    /// Print information about the focused window.
-    FocusedWindow,
+    /// List open windows.
+    Windows,
+    /// List open layer-shell surfaces.
+    Layers,
+    /// Get the configured keyboard layouts.
+    KeyboardLayouts,
     /// Print information about the focused output.
     FocusedOutput,
+    /// Print information about the focused window.
+    FocusedWindow,
+    /// Pick a window with the mouse and print information about it.
+    PickWindow,
+    /// Pick a color from the screen with the mouse.
+    PickColor,
     /// Perform an action.
     Action {
         #[command(subcommand)]
@@ -86,8 +102,41 @@ pub enum Msg {
         #[command(subcommand)]
         action: OutputAction,
     },
+    /// Start continuously receiving events from the compositor.
+    EventStream,
     /// Print the version of the running niri instance.
     Version,
     /// Request an error from the running niri instance.
     RequestError,
+    /// Print the overview state.
+    OverviewState,
+    /// List screencasts.
+    Casts,
+    /// Send a raw JSON request to the compositor, reading from stdin.
+    RawRequest,
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Elvish,
+    Fish,
+    PowerShell,
+    Zsh,
+    Nushell,
+}
+
+impl TryFrom<CompletionShell> for Shell {
+    type Error = &'static str;
+
+    fn try_from(shell: CompletionShell) -> Result<Self, Self::Error> {
+        match shell {
+            CompletionShell::Bash => Ok(Shell::Bash),
+            CompletionShell::Elvish => Ok(Shell::Elvish),
+            CompletionShell::Fish => Ok(Shell::Fish),
+            CompletionShell::PowerShell => Ok(Shell::PowerShell),
+            CompletionShell::Zsh => Ok(Shell::Zsh),
+            CompletionShell::Nushell => Err("Nushell should be handled separately"),
+        }
+    }
 }

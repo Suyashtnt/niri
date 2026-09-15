@@ -8,11 +8,16 @@ use smithay::backend::renderer::gles::{
 
 use super::renderer::NiriRenderer;
 use super::shader_element::ShaderProgram;
+use crate::render_helpers::blur::BlurProgram;
 
 pub struct Shaders {
     pub border: Option<ShaderProgram>,
+    pub shadow: Option<ShaderProgram>,
     pub clipped_surface: Option<GlesTexProgram>,
+    pub postprocess_and_clip: Option<GlesTexProgram>,
     pub resize: Option<ShaderProgram>,
+    pub gradient_fade: Option<GlesTexProgram>,
+    pub blur: Option<BlurProgram>,
     pub custom_resize: RefCell<Option<ShaderProgram>>,
     pub custom_close: RefCell<Option<ShaderProgram>>,
     pub custom_open: RefCell<Option<ShaderProgram>>,
@@ -21,6 +26,7 @@ pub struct Shaders {
 #[derive(Debug, Clone, Copy)]
 pub enum ProgramType {
     Border,
+    Shadow,
     Resize,
     Close,
     Open,
@@ -32,7 +38,10 @@ impl Shaders {
 
         let border = ShaderProgram::compile(
             renderer,
-            include_str!("border.frag"),
+            concat!(
+                include_str!("border.frag"),
+                include_str!("rounding_alpha.frag")
+            ),
             &[
                 UniformName::new("colorspace", UniformType::_1f),
                 UniformName::new("hue_interpolation", UniformType::_1f),
@@ -53,9 +62,36 @@ impl Shaders {
         })
         .ok();
 
+        let shadow = ShaderProgram::compile(
+            renderer,
+            concat!(
+                include_str!("shadow.frag"),
+                include_str!("rounding_alpha.frag")
+            ),
+            &[
+                UniformName::new("shadow_color", UniformType::_4f),
+                UniformName::new("sigma", UniformType::_1f),
+                UniformName::new("input_to_geo", UniformType::Matrix3x3),
+                UniformName::new("geo_size", UniformType::_2f),
+                UniformName::new("corner_radius", UniformType::_4f),
+                UniformName::new("window_input_to_geo", UniformType::Matrix3x3),
+                UniformName::new("window_geo_size", UniformType::_2f),
+                UniformName::new("window_corner_radius", UniformType::_4f),
+            ],
+            &[],
+        )
+        .map_err(|err| {
+            warn!("error compiling shadow shader: {err:?}");
+        })
+        .ok();
+
         let clipped_surface = renderer
             .compile_custom_texture_shader(
-                include_str!("clipped_surface.frag"),
+                concat!(
+                    include_str!("clipped_surface.frag"),
+                    include_str!("rounding_alpha.frag"),
+                    "\nvec4 postprocess(vec4 color) { return color; }",
+                ),
                 &[
                     UniformName::new("niri_scale", UniformType::_1f),
                     UniformName::new("geo_size", UniformType::_2f),
@@ -68,23 +104,65 @@ impl Shaders {
             })
             .ok();
 
+        let postprocess_and_clip = renderer
+            .compile_custom_texture_shader(
+                concat!(
+                    include_str!("clipped_surface.frag"),
+                    include_str!("rounding_alpha.frag"),
+                    include_str!("postprocess.frag"),
+                ),
+                &[
+                    UniformName::new("niri_scale", UniformType::_1f),
+                    UniformName::new("geo_size", UniformType::_2f),
+                    UniformName::new("corner_radius", UniformType::_4f),
+                    UniformName::new("input_to_geo", UniformType::Matrix3x3),
+                    UniformName::new("noise", UniformType::_1f),
+                    UniformName::new("saturation", UniformType::_1f),
+                    UniformName::new("bg_color", UniformType::_4f),
+                ],
+            )
+            .map_err(|err| {
+                warn!("error compiling postprocess_and_clip shader: {err:?}");
+            })
+            .ok();
+
         let resize = compile_resize_program(renderer, include_str!("resize.frag"))
             .map_err(|err| {
                 warn!("error compiling resize shader: {err:?}");
             })
             .ok();
 
+        let gradient_fade = renderer
+            .compile_custom_texture_shader(
+                include_str!("gradient_fade.frag"),
+                &[UniformName::new("cutoff", UniformType::_2f)],
+            )
+            .map_err(|err| {
+                warn!("error compiling gradient fade shader: {err:?}");
+            })
+            .ok();
+
+        let blur = BlurProgram::compile(renderer)
+            .map_err(|err| {
+                warn!("error compiling blur shaders: {err:?}");
+            })
+            .ok();
+
         Self {
             border,
+            shadow,
             clipped_surface,
+            postprocess_and_clip,
             resize,
+            gradient_fade,
+            blur,
             custom_resize: RefCell::new(None),
             custom_close: RefCell::new(None),
             custom_open: RefCell::new(None),
         }
     }
 
-    pub fn get_from_frame<'a>(frame: &'a mut GlesFrame<'_>) -> &'a Self {
+    pub fn get_from_frame<'a>(frame: &'a mut GlesFrame<'_, '_>) -> &'a Self {
         let data = frame.egl_context().user_data();
         data.get()
             .expect("shaders::init() must be called when creating the renderer")
@@ -121,6 +199,7 @@ impl Shaders {
     pub fn program(&self, program: ProgramType) -> Option<ShaderProgram> {
         match program {
             ProgramType::Border => self.border.clone(),
+            ProgramType::Shadow => self.shadow.clone(),
             ProgramType::Resize => self
                 .custom_resize
                 .borrow()
@@ -147,6 +226,7 @@ fn compile_resize_program(
     let mut program = include_str!("resize_prelude.frag").to_string();
     program.push_str(src);
     program.push_str(include_str!("resize_epilogue.frag"));
+    program.push_str(include_str!("rounding_alpha.frag"));
 
     ShaderProgram::compile(
         renderer,
@@ -273,7 +353,7 @@ pub fn set_custom_open_program(renderer: &mut GlesRenderer, src: Option<&str>) {
     }
 }
 
-pub fn mat3_uniform(name: &str, mat: Mat3) -> Uniform {
+pub fn mat3_uniform(name: &str, mat: Mat3) -> Uniform<'_> {
     Uniform::new(
         name,
         UniformValue::Matrix3x3 {

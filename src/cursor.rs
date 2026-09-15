@@ -4,12 +4,11 @@ use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::rc::Rc;
-use std::sync::Mutex;
 
 use anyhow::{anyhow, Context};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
-use smithay::input::pointer::{CursorIcon, CursorImageAttributes, CursorImageStatus};
+use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{IsAlive, Logical, Physical, Point, Transform};
 use smithay::wayland::compositor::with_states;
@@ -67,7 +66,7 @@ impl CursorManager {
                 let hotspot = with_states(&surface, |states| {
                     states
                         .data_map
-                        .get::<Mutex<CursorImageAttributes>>()
+                        .get::<CursorImageSurfaceData>()
                         .unwrap()
                         .lock()
                         .unwrap()
@@ -76,19 +75,22 @@ impl CursorManager {
 
                 RenderCursor::Surface { hotspot, surface }
             }
-            CursorImageStatus::Named(icon) => self
-                .get_cursor_with_name(icon, scale)
-                .map(|cursor| RenderCursor::Named {
-                    icon,
-                    scale,
-                    cursor,
-                })
-                .unwrap_or_else(|| RenderCursor::Named {
-                    icon: Default::default(),
-                    scale,
-                    cursor: self.get_default_cursor(scale),
-                }),
+            CursorImageStatus::Named(icon) => self.get_render_cursor_named(icon, scale),
         }
+    }
+
+    fn get_render_cursor_named(&self, icon: CursorIcon, scale: i32) -> RenderCursor {
+        self.get_cursor_with_name(icon, scale)
+            .map(|cursor| RenderCursor::Named {
+                icon,
+                scale,
+                cursor,
+            })
+            .unwrap_or_else(|| RenderCursor::Named {
+                icon: Default::default(),
+                scale,
+                cursor: self.get_default_cursor(scale),
+            })
     }
 
     pub fn is_current_cursor_animated(&self, scale: i32) -> bool {

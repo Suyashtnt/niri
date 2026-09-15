@@ -1,11 +1,20 @@
-use niri_config::{BlockOutFrom, BorderRule, CornerRadius, Match, WindowRule};
+use std::cmp::{max, min};
+
+use niri_config::utils::MergeWith as _;
+use niri_config::window_rule::{Match, OnXdgActivate, WindowRule};
+use niri_config::{
+    BackgroundEffect, BlockOutFrom, BorderRule, CornerRadius, FloatingPosition, PresetSize,
+    ResolvedPopupsRules, ShadowRule, TabIndicatorRule,
+};
+use niri_ipc::ColumnDisplay;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::utils::{Logical, Size};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::{
-    ToplevelSurface, XdgToplevelSurfaceData, XdgToplevelSurfaceRoleAttributes,
+    SurfaceCachedState, ToplevelSurface, XdgToplevelSurfaceRoleAttributes,
 };
 
-use crate::layout::workspace::ColumnWidth;
+use crate::utils::with_toplevel_role;
 
 pub mod mapped;
 pub use mapped::Mapped;
@@ -21,14 +30,27 @@ pub enum WindowRef<'a> {
 }
 
 /// Rules fully resolved for a window.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq, Clone)]
 pub struct ResolvedWindowRules {
     /// Default width for this window.
     ///
     /// - `None`: unset (global default should be used).
     /// - `Some(None)`: set to empty (window picks its own width).
     /// - `Some(Some(width))`: set to a particular width.
-    pub default_width: Option<Option<ColumnWidth>>,
+    pub default_width: Option<Option<PresetSize>>,
+
+    /// Default height for this window.
+    ///
+    /// - `None`: unset (global default should be used).
+    /// - `Some(None)`: set to empty (window picks its own height).
+    /// - `Some(Some(height))`: set to a particular height.
+    pub default_height: Option<Option<PresetSize>>,
+
+    /// Default column display for this window.
+    pub default_column_display: Option<ColumnDisplay>,
+
+    /// Default floating position for this window.
+    pub default_floating_position: Option<FloatingPosition>,
 
     /// Output to open this window on.
     pub open_on_output: Option<String>,
@@ -39,8 +61,20 @@ pub struct ResolvedWindowRules {
     /// Whether the window should open full-width.
     pub open_maximized: Option<bool>,
 
+    /// Whether the window should open maximized to edges (true maximized).
+    pub open_maximized_to_edges: Option<bool>,
+
     /// Whether the window should open fullscreen.
     pub open_fullscreen: Option<bool>,
+
+    /// Whether the window should open floating.
+    pub open_floating: Option<bool>,
+
+    /// Whether the window should open focused.
+    pub open_focused: Option<bool>,
+
+    /// What to do on xdg-activation requests.
+    pub on_xdg_activate: Option<OnXdgActivate>,
 
     /// Extra bound on the minimum window width.
     pub min_width: Option<u16>,
@@ -55,6 +89,10 @@ pub struct ResolvedWindowRules {
     pub focus_ring: BorderRule,
     /// Window border overrides.
     pub border: BorderRule,
+    /// Shadow overrides.
+    pub shadow: ShadowRule,
+    /// Tab indicator overrides.
+    pub tab_indicator: TabIndicatorRule,
 
     /// Whether or not to draw the border with a solid background.
     ///
@@ -70,8 +108,26 @@ pub struct ResolvedWindowRules {
     /// Whether to clip this window to its geometry, including the corner radius.
     pub clip_to_geometry: Option<bool>,
 
+    /// Whether to bob this window up and down.
+    pub baba_is_float: Option<bool>,
+
     /// Whether to block out this window from certain render targets.
     pub block_out_from: Option<BlockOutFrom>,
+
+    /// Whether to enable VRR on this window's primary output if it is on-demand.
+    pub variable_refresh_rate: Option<bool>,
+
+    /// Multiplier for all scroll events sent to this window.
+    pub scroll_factor: Option<f64>,
+
+    /// Override whether to set the Tiled xdg-toplevel state on the window.
+    pub tiled_state: Option<bool>,
+
+    /// Background effect configuration.
+    pub background_effect: BackgroundEffect,
+
+    /// Rules for this window's popups.
+    pub popups: ResolvedPopupsRules,
 }
 
 impl<'a> WindowRef<'a> {
@@ -89,66 +145,50 @@ impl<'a> WindowRef<'a> {
         }
     }
 
-    pub fn is_active_in_column(self) -> bool {
+    pub fn is_urgent(self) -> bool {
         match self {
             WindowRef::Unmapped(_) => false,
+            WindowRef::Mapped(mapped) => mapped.is_urgent(),
+        }
+    }
+
+    pub fn is_active_in_column(self) -> bool {
+        match self {
+            WindowRef::Unmapped(_) => true,
             WindowRef::Mapped(mapped) => mapped.is_active_in_column(),
+        }
+    }
+
+    pub fn is_floating(self) -> bool {
+        match self {
+            // FIXME: This means you cannot set initial configure rules based on is-floating. I'm
+            // not sure there's a good way to support it, since this matcher makes a cycle with the
+            // open-floating rule.
+            //
+            // That said, I don't think there are a lot of useful initial configure properties you
+            // may want to set through an is-floating matcher? Like, if you're configuring a
+            // specific window to open as floating, you can also set those properties in that same
+            // window rule, rather than relying on a different is-floating rule.
+            WindowRef::Unmapped(_) => false,
+            WindowRef::Mapped(mapped) => mapped.is_floating(),
+        }
+    }
+
+    pub fn is_window_cast_target(self) -> bool {
+        match self {
+            WindowRef::Unmapped(_) => false,
+            WindowRef::Mapped(mapped) => mapped.is_window_cast_target(),
         }
     }
 }
 
 impl ResolvedWindowRules {
-    pub const fn empty() -> Self {
-        Self {
-            default_width: None,
-            open_on_output: None,
-            open_on_workspace: None,
-            open_maximized: None,
-            open_fullscreen: None,
-            min_width: None,
-            min_height: None,
-            max_width: None,
-            max_height: None,
-            focus_ring: BorderRule {
-                off: false,
-                on: false,
-                width: None,
-                active_color: None,
-                inactive_color: None,
-                active_gradient: None,
-                inactive_gradient: None,
-            },
-            border: BorderRule {
-                off: false,
-                on: false,
-                width: None,
-                active_color: None,
-                inactive_color: None,
-                active_gradient: None,
-                inactive_gradient: None,
-            },
-            draw_border_with_background: None,
-            opacity: None,
-            geometry_corner_radius: None,
-            clip_to_geometry: None,
-            block_out_from: None,
-        }
-    }
-
     pub fn compute(rules: &[WindowRule], window: WindowRef, is_at_startup: bool) -> Self {
         let _span = tracy_client::span!("ResolvedWindowRules::compute");
 
-        let mut resolved = ResolvedWindowRules::empty();
+        let mut resolved = ResolvedWindowRules::default();
 
-        let toplevel = window.toplevel();
-        with_states(toplevel.wl_surface(), |states| {
-            let mut role = states
-                .data_map
-                .get::<XdgToplevelSurfaceData>()
-                .unwrap()
-                .lock()
-                .unwrap();
-
+        with_toplevel_role(window.toplevel(), |role| {
             // Ensure server_pending like in Smithay's with_pending_state().
             if role.server_pending.is_none() {
                 role.server_pending = Some(role.current_server_state().clone());
@@ -165,7 +205,7 @@ impl ResolvedWindowRules {
                         }
                     }
 
-                    window_matches(window, &role, m)
+                    window_matches(window, role, m)
                 };
 
                 if !(rule.matches.is_empty() || rule.matches.iter().any(matches)) {
@@ -176,12 +216,20 @@ impl ResolvedWindowRules {
                     continue;
                 }
 
-                if let Some(x) = rule
-                    .default_column_width
-                    .as_ref()
-                    .map(|d| d.0.map(ColumnWidth::from))
-                {
-                    resolved.default_width = Some(x);
+                if let Some(x) = rule.default_column_width {
+                    resolved.default_width = Some(x.0);
+                }
+
+                if let Some(x) = rule.default_window_height {
+                    resolved.default_height = Some(x.0);
+                }
+
+                if let Some(x) = rule.default_column_display {
+                    resolved.default_column_display = Some(x);
+                }
+
+                if let Some(x) = rule.default_floating_position {
+                    resolved.default_floating_position = Some(x);
                 }
 
                 if let Some(x) = rule.open_on_output.as_deref() {
@@ -196,8 +244,24 @@ impl ResolvedWindowRules {
                     resolved.open_maximized = Some(x);
                 }
 
+                if let Some(x) = rule.open_maximized_to_edges {
+                    resolved.open_maximized_to_edges = Some(x);
+                }
+
                 if let Some(x) = rule.open_fullscreen {
                     resolved.open_fullscreen = Some(x);
+                }
+
+                if let Some(x) = rule.open_floating {
+                    resolved.open_floating = Some(x);
+                }
+
+                if let Some(x) = rule.open_focused {
+                    resolved.open_focused = Some(x);
+                }
+
+                if let Some(x) = rule.on_xdg_activate {
+                    resolved.on_xdg_activate = Some(x);
                 }
 
                 if let Some(x) = rule.min_width {
@@ -215,6 +279,8 @@ impl ResolvedWindowRules {
 
                 resolved.focus_ring.merge_with(&rule.focus_ring);
                 resolved.border.merge_with(&rule.border);
+                resolved.shadow.merge_with(&rule.shadow);
+                resolved.tab_indicator.merge_with(&rule.tab_indicator);
 
                 if let Some(x) = rule.draw_border_with_background {
                     resolved.draw_border_with_background = Some(x);
@@ -228,9 +294,27 @@ impl ResolvedWindowRules {
                 if let Some(x) = rule.clip_to_geometry {
                     resolved.clip_to_geometry = Some(x);
                 }
+                if let Some(x) = rule.baba_is_float {
+                    resolved.baba_is_float = Some(x);
+                }
                 if let Some(x) = rule.block_out_from {
                     resolved.block_out_from = Some(x);
                 }
+                if let Some(x) = rule.variable_refresh_rate {
+                    resolved.variable_refresh_rate = Some(x);
+                }
+                if let Some(x) = rule.scroll_factor {
+                    resolved.scroll_factor = Some(x.0);
+                }
+                if let Some(x) = rule.tiled_state {
+                    resolved.tiled_state = Some(x);
+                }
+
+                resolved
+                    .background_effect
+                    .merge_with(&rule.background_effect);
+
+                resolved.popups.merge_with(&rule.popups);
             }
 
             resolved.open_on_output = open_on_output.map(|x| x.to_owned());
@@ -238,6 +322,71 @@ impl ResolvedWindowRules {
         });
 
         resolved
+    }
+
+    pub fn apply_min_size(&self, min_size: Size<i32, Logical>) -> Size<i32, Logical> {
+        let mut size = min_size;
+
+        if let Some(x) = self.min_width {
+            size.w = max(size.w, i32::from(x));
+        }
+        if let Some(x) = self.min_height {
+            size.h = max(size.h, i32::from(x));
+        }
+
+        size
+    }
+
+    pub fn apply_max_size(&self, max_size: Size<i32, Logical>) -> Size<i32, Logical> {
+        let mut size = max_size;
+
+        if let Some(x) = self.max_width {
+            if size.w == 0 {
+                size.w = i32::from(x);
+            } else if x > 0 {
+                size.w = min(size.w, i32::from(x));
+            }
+        }
+        if let Some(x) = self.max_height {
+            if size.h == 0 {
+                size.h = i32::from(x);
+            } else if x > 0 {
+                size.h = min(size.h, i32::from(x));
+            }
+        }
+
+        size
+    }
+
+    pub fn apply_min_max_size(
+        &self,
+        min_size: Size<i32, Logical>,
+        max_size: Size<i32, Logical>,
+    ) -> (Size<i32, Logical>, Size<i32, Logical>) {
+        let min_size = self.apply_min_size(min_size);
+        let max_size = self.apply_max_size(max_size);
+        (min_size, max_size)
+    }
+
+    pub fn compute_open_floating(&self, toplevel: &ToplevelSurface) -> bool {
+        if let Some(res) = self.open_floating {
+            return res;
+        }
+
+        // Windows with a parent (usually dialogs) open as floating by default.
+        if toplevel.parent().is_some() {
+            return true;
+        }
+
+        let (min_size, max_size) = with_states(toplevel.wl_surface(), |state| {
+            let mut guard = state.cached_state.get::<SurfaceCachedState>();
+            let current = guard.current();
+            (current.min_size, current.max_size)
+        });
+        let (min_size, max_size) = self.apply_min_max_size(min_size, max_size);
+
+        // We open fixed-height windows as floating.
+        min_size.h > 0 && min_size.h == max_size.h
     }
 }
 
@@ -247,6 +396,12 @@ fn window_matches(window: WindowRef, role: &XdgToplevelSurfaceRoleAttributes, m:
 
     if let Some(is_focused) = m.is_focused {
         if window.is_focused() != is_focused {
+            return false;
+        }
+    }
+
+    if let Some(is_urgent) = m.is_urgent {
+        if window.is_urgent() != is_urgent {
             return false;
         }
     }
@@ -265,7 +420,7 @@ fn window_matches(window: WindowRef, role: &XdgToplevelSurfaceRoleAttributes, m:
         let Some(app_id) = &role.app_id else {
             return false;
         };
-        if !app_id_re.is_match(app_id) {
+        if !app_id_re.0.is_match(app_id) {
             return false;
         }
     }
@@ -274,13 +429,25 @@ fn window_matches(window: WindowRef, role: &XdgToplevelSurfaceRoleAttributes, m:
         let Some(title) = &role.title else {
             return false;
         };
-        if !title_re.is_match(title) {
+        if !title_re.0.is_match(title) {
             return false;
         }
     }
 
     if let Some(is_active_in_column) = m.is_active_in_column {
         if window.is_active_in_column() != is_active_in_column {
+            return false;
+        }
+    }
+
+    if let Some(is_floating) = m.is_floating {
+        if window.is_floating() != is_floating {
+            return false;
+        }
+    }
+
+    if let Some(is_window_cast_target) = m.is_window_cast_target {
+        if window.is_window_cast_target() != is_window_cast_target {
             return false;
         }
     }

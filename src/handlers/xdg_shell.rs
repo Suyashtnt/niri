@@ -1,11 +1,15 @@
 use std::cell::Cell;
 
+use calloop::Interest;
+use niri_config::PresetSize;
+use smithay::backend::input::InputTime;
 use smithay::desktop::{
     find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output, utils, LayerSurface,
     PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy, Window,
     WindowSurfaceType,
 };
 use smithay::input::pointer::Focus;
+use smithay::input::tablet::TabletSeatTrait;
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::ConstraintAdjustment;
@@ -17,26 +21,30 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{self, Resource, WEnum};
 use smithay::utils::{Logical, Rectangle, Serial};
 use smithay::wayland::compositor::{
-    add_pre_commit_hook, with_states, BufferAssignment, HookId, SurfaceAttributes,
+    add_blocker, add_pre_commit_hook, with_states, BufferAssignment, CompositorHandler as _,
+    HookId, SurfaceAttributes,
 };
+use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::wayland::input_method::InputMethodSeat;
 use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 use smithay::wayland::shell::wlr_layer::{self, Layer};
 use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
 use smithay::wayland::shell::xdg::{
-    PopupSurface, PositionerState, ToplevelSurface, XdgPopupSurfaceData, XdgShellHandler,
-    XdgShellState, XdgToplevelSurfaceData,
+    PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+    XdgToplevelSurfaceData,
 };
 use smithay::wayland::xdg_foreign::{XdgForeignHandler, XdgForeignState};
-use smithay::{
-    delegate_kde_decoration, delegate_xdg_decoration, delegate_xdg_foreign, delegate_xdg_shell,
-};
+use tracing::field::Empty;
 
+use crate::input::move_grab::MoveGrab;
 use crate::input::resize_grab::ResizeGrab;
-use crate::input::DOUBLE_CLICK_TIME;
-use crate::layout::workspace::ColumnWidth;
-use crate::niri::{PopupGrabState, State};
-use crate::utils::{get_monotonic_time, send_scale_transform, ResizeEdge};
+use crate::input::{AnyStartData, DOUBLE_CLICK_TIME};
+use crate::layout::ActivateWindow;
+use crate::niri::{CastTarget, PopupGrabState, State};
+use crate::utils::transaction::Transaction;
+use crate::utils::{
+    get_monotonic_time, output_matches_name, send_scale_transform, update_tiled_state, ResizeEdge,
+};
 use crate::window::{InitialConfigureState, ResolvedWindowRules, Unmapped, WindowRef};
 
 impl XdgShellHandler for State {
@@ -60,8 +68,117 @@ impl XdgShellHandler for State {
         }
     }
 
-    fn move_request(&mut self, _surface: ToplevelSurface, _seat: WlSeat, _serial: Serial) {
-        // FIXME
+    fn move_request(&mut self, surface: ToplevelSurface, _seat: WlSeat, serial: Serial) {
+        let wl_surface = surface.wl_surface();
+
+        let mut grab_start_data = None;
+
+        // See if this comes from a pointer grab.
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        pointer.with_grab(|grab_serial, grab| {
+            if grab_serial == serial {
+                let start_data = grab.start_data();
+                if let Some((focus, _)) = &start_data.focus {
+                    if focus.id().same_client_as(&wl_surface.id()) {
+                        // Deny move requests from DnD grabs to work around
+                        // https://gitlab.gnome.org/GNOME/gtk/-/issues/7113
+                        let is_dnd_grab = Self::is_dnd_grab(grab.as_any());
+
+                        if !is_dnd_grab {
+                            grab_start_data = Some(AnyStartData::Pointer(start_data.clone()));
+                        }
+                    }
+                }
+            }
+        });
+
+        // See if this comes from a touch grab.
+        if let Some(touch) = self.niri.seat.get_touch() {
+            touch.with_grab(|grab_serial, grab| {
+                if grab_serial == serial {
+                    let start_data = grab.start_data();
+                    if let Some((focus, _)) = &start_data.focus {
+                        if focus.id().same_client_as(&wl_surface.id()) {
+                            // Deny move requests from DnD grabs to work around
+                            // https://gitlab.gnome.org/GNOME/gtk/-/issues/7113
+                            let is_dnd_grab = Self::is_dnd_grab(grab.as_any());
+
+                            if !is_dnd_grab {
+                                grab_start_data = Some(AnyStartData::Touch(start_data.clone()));
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // See if this comes from a tablet tool grab.
+        let mut tablet_tool = None;
+        let tools = self.niri.seat.tablet_seat().get_tools();
+        for tool in tools.values() {
+            let found = tool.with_grab(|grab_serial, grab| {
+                if grab_serial == serial {
+                    let start_data = grab.start_data();
+                    if let Some((focus, _)) = &start_data.focus {
+                        if focus.id().same_client_as(&wl_surface.id()) {
+                            // Deny move requests from DnD grabs to work around
+                            // https://gitlab.gnome.org/GNOME/gtk/-/issues/7113
+                            let is_dnd_grab = Self::is_dnd_grab(grab.as_any());
+
+                            if !is_dnd_grab {
+                                grab_start_data =
+                                    Some(AnyStartData::TabletTool(start_data.clone()));
+                                tablet_tool = Some(tool.clone());
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            });
+            if found == Some(true) {
+                break;
+            }
+        }
+
+        let Some(start_data) = grab_start_data else {
+            return;
+        };
+
+        let Some((mapped, output)) = self.niri.layout.find_window_and_output(wl_surface) else {
+            return;
+        };
+
+        let Some(output) = output else {
+            return;
+        };
+
+        let window = mapped.window.clone();
+        let output = output.clone();
+
+        match &start_data {
+            AnyStartData::Pointer(_) => {
+                if let Some(grab) = MoveGrab::new(self, start_data, window.clone(), true, None) {
+                    pointer.set_grab(self, grab, serial, Focus::Clear);
+                }
+            }
+            AnyStartData::Touch(_) => {
+                let touch = self.niri.seat.get_touch().unwrap();
+                if let Some(grab) = MoveGrab::new(self, start_data, window.clone(), true, None) {
+                    touch.set_grab(self, grab, serial);
+                }
+            }
+            AnyStartData::TabletTool(_) => {
+                if let Some(grab) = MoveGrab::new(self, start_data, window.clone(), true, None) {
+                    let time = InputTime::now();
+                    tablet_tool
+                        .unwrap()
+                        .set_grab(self, grab, time, serial, Focus::Clear);
+                }
+            }
+        }
+
+        self.niri.queue_redraw(&output);
     }
 
     fn resize_request(
@@ -71,23 +188,55 @@ impl XdgShellHandler for State {
         serial: Serial,
         edges: xdg_toplevel::ResizeEdge,
     ) {
-        let pointer = self.niri.seat.get_pointer().unwrap();
-        if !pointer.has_grab(serial) {
-            return;
-        }
-
-        let Some(start_data) = pointer.grab_start_data() else {
-            return;
-        };
-
-        let Some((focus, _)) = &start_data.focus else {
-            return;
-        };
-
         let wl_surface = surface.wl_surface();
-        if !focus.id().same_client_as(&wl_surface.id()) {
-            return;
+
+        let mut grab_start_data = None;
+
+        // See if this comes from a pointer grab.
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        if pointer.has_grab(serial) {
+            if let Some(start_data) = pointer.grab_start_data() {
+                if let Some((focus, _)) = &start_data.focus {
+                    if focus.id().same_client_as(&wl_surface.id()) {
+                        grab_start_data = Some(AnyStartData::Pointer(start_data));
+                    }
+                }
+            }
         }
+
+        // See if this comes from a touch grab.
+        if let Some(touch) = self.niri.seat.get_touch() {
+            if touch.has_grab(serial) {
+                if let Some(start_data) = touch.grab_start_data() {
+                    if let Some((focus, _)) = &start_data.focus {
+                        if focus.id().same_client_as(&wl_surface.id()) {
+                            grab_start_data = Some(AnyStartData::Touch(start_data));
+                        }
+                    }
+                }
+            }
+        }
+
+        // See if this comes from a tablet tool grab.
+        let mut tablet_tool = None;
+        let tools = self.niri.seat.tablet_seat().get_tools();
+        'outer: for tool in tools.values() {
+            if tool.has_grab(serial) {
+                if let Some(start_data) = tool.grab_start_data() {
+                    if let Some((focus, _)) = &start_data.focus {
+                        if focus.id().same_client_as(&wl_surface.id()) {
+                            grab_start_data = Some(AnyStartData::TabletTool(start_data));
+                            tablet_tool = Some(tool.clone());
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+
+        let Some(start_data) = grab_start_data else {
+            return;
+        };
 
         let Some((mapped, _)) = self.niri.layout.find_window_and_output(wl_surface) else {
             return;
@@ -99,8 +248,16 @@ impl XdgShellHandler for State {
         // See if we got a double resize-click gesture.
         let time = get_monotonic_time();
         let last_cell = mapped.last_interactive_resize_start();
-        let last = last_cell.get();
+        let mut last = last_cell.get();
         last_cell.set(Some((time, edges)));
+
+        // Floating windows don't have either of the double-resize-click gestures, so just allow it
+        // to resize.
+        if mapped.is_floating() {
+            last = None;
+            last_cell.set(None);
+        }
+
         if let Some((last_time, last_edges)) = last {
             if time.saturating_sub(last_time) <= DOUBLE_CLICK_TIME {
                 // Allow quick resize after a triple click.
@@ -114,10 +271,8 @@ impl XdgShellHandler for State {
                     self.niri.layout.toggle_full_width();
                 }
                 if intersection.intersects(ResizeEdge::TOP_BOTTOM) {
-                    // FIXME: don't activate once we can pass specific windows to actions.
-                    self.niri.layout.activate_window(&window);
                     self.niri.layer_shell_on_demand_focus = None;
-                    self.niri.layout.reset_window_height();
+                    self.niri.layout.reset_window_height(Some(&window));
                 }
                 // FIXME: granular.
                 self.niri.queue_redraw_all();
@@ -125,14 +280,32 @@ impl XdgShellHandler for State {
             }
         }
 
-        let grab = ResizeGrab::new(start_data, window.clone());
-
-        if !self.niri.layout.interactive_resize_begin(window, edges) {
+        if !self
+            .niri
+            .layout
+            .interactive_resize_begin(window.clone(), edges)
+        {
             return;
         }
 
-        pointer.set_grab(self, grab, serial, Focus::Clear);
-        self.niri.pointer_grab_ongoing = true;
+        match start_data {
+            AnyStartData::Pointer(_) => {
+                let grab = ResizeGrab::new(start_data, window);
+                pointer.set_grab(self, grab, serial, Focus::Clear);
+            }
+            AnyStartData::Touch(_) => {
+                let touch = self.niri.seat.get_touch().unwrap();
+                let grab = ResizeGrab::new(start_data, window);
+                touch.set_grab(self, grab, serial);
+            }
+            AnyStartData::TabletTool(_) => {
+                let grab = ResizeGrab::new(start_data, window);
+                let time = InputTime::now();
+                tablet_tool
+                    .unwrap()
+                    .set_grab(self, grab, time, serial, Focus::Clear);
+            }
+        }
     }
 
     fn reposition_request(
@@ -151,49 +324,56 @@ impl XdgShellHandler for State {
     }
 
     fn grab(&mut self, surface: PopupSurface, _seat: WlSeat, serial: Serial) {
-        // HACK: ignore grabs (pretend they work without actually grabbing) if the input method has
-        // a grab. It will likely need refactors in Smithay to support properly since grabs just
-        // replace each other.
-        // FIXME: do this properly.
-        if self.niri.seat.input_method().keyboard_grabbed() {
-            trace!("ignoring popup grab because IME has keyboard grabbed");
-            return;
-        }
-
         let popup = PopupKind::Xdg(surface);
         let Ok(root) = find_popup_root_surface(&popup) else {
+            trace!("ignoring popup grab because no root surface");
             return;
         };
 
         // We need to hand out the grab in a way consistent with what update_keyboard_focus()
         // thinks the current focus is, otherwise it will desync and cause weird issues with
         // keyboard focus being at the wrong place.
-        if self.niri.is_locked() {
+        if self.niri.exit_confirm_dialog.is_open() {
+            trace!("ignoring popup grab because the exit confirm dialog is open");
+            let _ = PopupManager::dismiss_popup(&root, &popup);
+            return;
+        } else if self.niri.is_locked() {
             if Some(&root) != self.niri.lock_surface_focus().as_ref() {
+                trace!("ignoring popup grab because the session is locked");
                 let _ = PopupManager::dismiss_popup(&root, &popup);
                 return;
             }
         } else if self.niri.screenshot_ui.is_open() {
+            trace!("ignoring popup grab because the screenshot UI is open");
             let _ = PopupManager::dismiss_popup(&root, &popup);
             return;
         } else if let Some(output) = self.niri.layout.active_output() {
             let layers = layer_map_for_output(output);
 
-            if let Some(layer_surface) =
-                layers.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)
-            {
-                if !matches!(layer_surface.layer(), Layer::Overlay | Layer::Top) {
-                    let _ = PopupManager::dismiss_popup(&root, &popup);
-                    return;
-                }
+            // FIXME: somewhere here we probably need to check is_overview_open to match the logic
+            // in update_keyboard_focus().
 
-                // FIXME: popup grabs for on-demand bottom and background layers.
+            if let Some(layer) = layers.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL) {
+                // This is a grab for a layer surface.
+
+                if let Some(mapped) = self.niri.mapped_layer_surfaces.get(layer) {
+                    if mapped.place_within_backdrop() {
+                        trace!("ignoring popup grab for a layer surface within overview backdrop");
+                        let _ = PopupManager::dismiss_popup(&root, &popup);
+                        return;
+                    }
+                }
             } else {
+                // This is a grab for a regular window; check that there's no layer surface with a
+                // higher input priority.
+
                 if layers.layers_on(Layer::Overlay).any(|l| {
-                    l.cached_state().keyboard_interactivity
+                    (l.cached_state().keyboard_interactivity
                         == wlr_layer::KeyboardInteractivity::Exclusive
-                        || Some(l) == self.niri.layer_shell_on_demand_focus.as_ref()
+                        || Some(l) == self.niri.layer_shell_on_demand_focus.as_ref())
+                        && self.niri.mapped_layer_surfaces.contains_key(l)
                 }) {
+                    trace!("ignoring toplevel popup grab because the overlay layer has focus");
                     let _ = PopupManager::dismiss_popup(&root, &popup);
                     return;
                 }
@@ -201,113 +381,119 @@ impl XdgShellHandler for State {
                 let mon = self.niri.layout.monitor_for_output(output).unwrap();
                 if !mon.render_above_top_layer()
                     && layers.layers_on(Layer::Top).any(|l| {
-                        l.cached_state().keyboard_interactivity
+                        (l.cached_state().keyboard_interactivity
                             == wlr_layer::KeyboardInteractivity::Exclusive
-                            || Some(l) == self.niri.layer_shell_on_demand_focus.as_ref()
+                            || Some(l) == self.niri.layer_shell_on_demand_focus.as_ref())
+                            && self.niri.mapped_layer_surfaces.contains_key(l)
                     })
                 {
+                    trace!("ignoring toplevel popup grab because the top layer has focus");
                     let _ = PopupManager::dismiss_popup(&root, &popup);
                     return;
                 }
 
                 let layout_focus = self.niri.layout.focus();
                 if Some(&root) != layout_focus.map(|win| win.toplevel().wl_surface()) {
+                    trace!("ignoring toplevel popup grab because another window has focus");
                     let _ = PopupManager::dismiss_popup(&root, &popup);
                     return;
                 }
             }
         } else {
+            trace!("ignoring popup grab because no output is active");
             let _ = PopupManager::dismiss_popup(&root, &popup);
             return;
         }
 
         let seat = &self.niri.seat;
-        let Ok(mut grab) = self
+        let mut grab = match self
             .niri
             .popups
             .grab_popup(root.clone(), popup, seat, serial)
-        else {
-            return;
+        {
+            Ok(grab) => grab,
+            Err(err) => {
+                trace!("ignoring popup grab: {err:?}");
+                return;
+            }
         };
 
         let keyboard = seat.get_keyboard().unwrap();
         let pointer = seat.get_pointer().unwrap();
 
+        // Smithay cannot do overlapping grabs, so if we have an IME keyboard grab, don't overwrite
+        // it with a popup keyboard grab. This makes the popup menu work in Telegram while an IME
+        // is active (otherwise it hits the grab mismatch check below).
+        //
+        // The second check is for layer surfaces that can't receive keyboard focus, without it
+        // popups don't work properly in Waybar (GTK 3).
+        let can_receive_keyboard_focus = !self.niri.seat.input_method().keyboard_grabbed()
+            && self
+                .niri
+                .layout
+                .active_output()
+                .and_then(|output| {
+                    layer_map_for_output(output)
+                        .layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)
+                        .map(|layer_surface| layer_surface.can_receive_keyboard_focus())
+                })
+                .unwrap_or(true);
+
         let keyboard_grab_mismatches = keyboard.is_grabbed()
             && !(keyboard.has_grab(serial)
-                || grab
-                    .previous_serial()
-                    .map_or(true, |s| keyboard.has_grab(s)));
+                || grab.previous_serial().is_none_or(|s| keyboard.has_grab(s)));
         let pointer_grab_mismatches = pointer.is_grabbed()
             && !(pointer.has_grab(serial)
-                || grab.previous_serial().map_or(true, |s| pointer.has_grab(s)));
-        if keyboard_grab_mismatches || pointer_grab_mismatches {
+                || grab.previous_serial().is_none_or(|s| pointer.has_grab(s)));
+        if (can_receive_keyboard_focus && keyboard_grab_mismatches) || pointer_grab_mismatches {
+            trace!("ignoring popup grab because of current grab mismatch");
             grab.ungrab(PopupUngrabStrategy::All);
             return;
         }
 
         trace!("new grab for root {:?}", root);
-        keyboard.set_focus(self, grab.current_grab(), serial);
-        keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
-        pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
-        self.niri.popup_grab = Some(PopupGrabState { root, grab });
-    }
-
-    fn maximize_request(&mut self, surface: ToplevelSurface) {
-        // FIXME
-
-        // A configure is required in response to this event. However, if an initial configure
-        // wasn't sent, then we will send this as part of the initial configure later.
-        if initial_configure_sent(&surface) {
-            surface.send_configure();
+        if can_receive_keyboard_focus {
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
         }
+        pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        self.niri.popup_grab = Some(PopupGrabState {
+            root,
+            grab,
+            has_keyboard_grab: can_receive_keyboard_focus,
+        });
     }
 
-    fn unmaximize_request(&mut self, _surface: ToplevelSurface) {
-        // FIXME
-    }
-
-    fn fullscreen_request(
-        &mut self,
-        toplevel: ToplevelSurface,
-        wl_output: Option<wl_output::WlOutput>,
-    ) {
-        let requested_output = wl_output.as_ref().and_then(Output::from_resource);
-
-        if let Some((mapped, current_output)) = self
+    fn maximize_request(&mut self, toplevel: ToplevelSurface) {
+        if let Some((mapped, _)) = self
             .niri
             .layout
-            .find_window_and_output(toplevel.wl_surface())
+            .find_window_and_output_mut(toplevel.wl_surface())
         {
-            let window = mapped.window.clone();
-
-            if let Some(requested_output) = requested_output {
-                if &requested_output != current_output {
-                    self.niri
-                        .layout
-                        .move_window_to_output(&window, &requested_output);
-                }
-            }
-
-            self.niri.layout.set_fullscreen(&window, true);
-
             // A configure is required in response to this event regardless if there are pending
             // changes.
-            toplevel.send_configure();
+            mapped.set_needs_configure();
+
+            let window = mapped.window.clone();
+            self.niri.layout.set_maximized(&window, true);
         } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {
-                InitialConfigureState::NotConfigured { wants_fullscreen } => {
-                    *wants_fullscreen = Some(requested_output);
+                InitialConfigureState::NotConfigured {
+                    wants_maximized, ..
+                } => {
+                    *wants_maximized = true;
 
                     // The required configure will be the initial configure.
                 }
-                InitialConfigureState::Configured { rules, output, .. } => {
+                InitialConfigureState::Configured {
+                    rules,
+                    output,
+                    is_pending_maximized,
+                    ..
+                } => {
                     // Figure out the monitor following a similar logic to initial configure.
                     // FIXME: deduplicate.
-                    let mon = requested_output
+                    let mon = output
                         .as_ref()
-                        // If none requested, try currently configured output.
-                        .or(output.as_ref())
                         .and_then(|o| self.niri.layout.monitor_for_output(o))
                         .map(|mon| (mon, false))
                         // If not, check if we have a parent with a monitor.
@@ -315,7 +501,7 @@ impl XdgShellHandler for State {
                             toplevel
                                 .parent()
                                 .and_then(|parent| self.niri.layout.find_window_and_output(&parent))
-                                .map(|(_win, output)| output)
+                                .and_then(|(_win, output)| output)
                                 .and_then(|o| self.niri.layout.monitor_for_output(o))
                                 .map(|mon| (mon, true))
                         })
@@ -329,7 +515,7 @@ impl XdgShellHandler for State {
 
                     *output = mon
                         .filter(|(_, parent)| !parent)
-                        .map(|(mon, _)| mon.output.clone());
+                        .map(|(mon, _)| mon.output().clone());
                     let mon = mon.map(|(mon, _)| mon);
 
                     let ws = mon
@@ -337,10 +523,16 @@ impl XdgShellHandler for State {
                         .or_else(|| self.niri.layout.active_workspace());
 
                     if let Some(ws) = ws {
+                        // If the window is pending fullscreen, then this will do nothing. But
+                        // that's expected: the window remains fullscreen, and we simply remember
+                        // that it is now pending maximized.
+                        *is_pending_maximized = true;
                         toplevel.with_pending_state(|state| {
-                            state.states.set(xdg_toplevel::State::Fullscreen);
+                            if !state.states.contains(xdg_toplevel::State::Fullscreen) {
+                                state.states.set(xdg_toplevel::State::Maximized);
+                            }
                         });
-                        ws.configure_new_window(&unmapped.window, None, rules);
+                        ws.configure_new_window(&unmapped.window, None, None, false, rules);
                     }
 
                     // We already sent the initial configure, so we need to reconfigure.
@@ -348,36 +540,42 @@ impl XdgShellHandler for State {
                 }
             }
         } else {
-            error!("couldn't find the toplevel in fullscreen_request()");
+            error!("couldn't find the toplevel in maximize_request()");
             toplevel.send_configure();
         }
     }
 
-    fn unfullscreen_request(&mut self, toplevel: ToplevelSurface) {
+    fn unmaximize_request(&mut self, toplevel: ToplevelSurface) {
         if let Some((mapped, _)) = self
             .niri
             .layout
-            .find_window_and_output(toplevel.wl_surface())
+            .find_window_and_output_mut(toplevel.wl_surface())
         {
-            let window = mapped.window.clone();
-            self.niri.layout.set_fullscreen(&window, false);
-
             // A configure is required in response to this event regardless if there are pending
             // changes.
-            toplevel.send_configure();
+            mapped.set_needs_configure();
+
+            let window = mapped.window.clone();
+            self.niri.layout.set_maximized(&window, false);
         } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {
-                InitialConfigureState::NotConfigured { wants_fullscreen } => {
-                    *wants_fullscreen = None;
+                InitialConfigureState::NotConfigured {
+                    wants_maximized, ..
+                } => {
+                    *wants_maximized = false;
 
                     // The required configure will be the initial configure.
                 }
                 InitialConfigureState::Configured {
                     rules,
                     width,
+                    height,
+                    floating_width,
+                    floating_height,
                     is_full_width,
                     output,
                     workspace_name,
+                    is_pending_maximized,
                 } => {
                     // Figure out the monitor following a similar logic to initial configure.
                     // FIXME: deduplicate.
@@ -398,7 +596,7 @@ impl XdgShellHandler for State {
                                     .and_then(|parent| {
                                         self.niri.layout.find_window_and_output(&parent)
                                     })
-                                    .map(|(_win, output)| output)
+                                    .and_then(|(_win, output)| output)
                                     .and_then(|o| self.niri.layout.monitor_for_output(o))
                                     .map(|mon| (mon, true))
                             })
@@ -413,7 +611,218 @@ impl XdgShellHandler for State {
 
                     *output = mon
                         .filter(|(_, parent)| !parent)
-                        .map(|(mon, _)| mon.output.clone());
+                        .map(|(mon, _)| mon.output().clone());
+                    let mon = mon.map(|(mon, _)| mon);
+
+                    let ws = workspace_name
+                        .as_deref()
+                        .and_then(|name| mon.map(|mon| mon.find_named_workspace(name)))
+                        .unwrap_or_else(|| {
+                            mon.map(|mon| mon.active_workspace_ref())
+                                .or_else(|| self.niri.layout.active_workspace())
+                        });
+
+                    if let Some(ws) = ws {
+                        // If the window is pending fullscreen, then this will do nothing since
+                        // then the Maximized state is already unset. But that's expected: the
+                        // window remains fullscreen, and we simply remember that it is no
+                        // longer pending maximized.
+                        *is_pending_maximized = false;
+                        toplevel.with_pending_state(|state| {
+                            state.states.unset(xdg_toplevel::State::Maximized);
+                        });
+
+                        let is_floating = rules.compute_open_floating(&toplevel);
+                        let configure_width = if is_floating {
+                            *floating_width
+                        } else if *is_full_width {
+                            Some(PresetSize::Proportion(1.))
+                        } else {
+                            *width
+                        };
+                        let configure_height = if is_floating {
+                            *floating_height
+                        } else {
+                            *height
+                        };
+                        ws.configure_new_window(
+                            &unmapped.window,
+                            configure_width,
+                            configure_height,
+                            is_floating,
+                            rules,
+                        );
+                    }
+
+                    // We already sent the initial configure, so we need to reconfigure.
+                    toplevel.send_configure();
+                }
+            }
+        } else {
+            error!("couldn't find the toplevel in unmaximize_request()");
+            toplevel.send_configure();
+        }
+    }
+
+    fn fullscreen_request(
+        &mut self,
+        toplevel: ToplevelSurface,
+        wl_output: Option<wl_output::WlOutput>,
+    ) {
+        let requested_output = wl_output.and_then(|o| self.niri.output_from_resource(&o));
+
+        if let Some((mapped, current_output)) = self
+            .niri
+            .layout
+            .find_window_and_output_mut(toplevel.wl_surface())
+        {
+            // A configure is required in response to this event regardless if there are pending
+            // changes.
+            mapped.set_needs_configure();
+
+            let window = mapped.window.clone();
+
+            if let Some(requested_output) = requested_output {
+                if Some(&requested_output) != current_output {
+                    self.niri.layout.move_to_output(
+                        Some(&window),
+                        &requested_output,
+                        None,
+                        ActivateWindow::Smart,
+                    );
+                }
+            }
+
+            self.niri.layout.set_fullscreen(&window, true);
+        } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
+            match &mut unmapped.state {
+                InitialConfigureState::NotConfigured {
+                    wants_fullscreen, ..
+                } => {
+                    *wants_fullscreen = Some(requested_output);
+
+                    // The required configure will be the initial configure.
+                }
+                InitialConfigureState::Configured { rules, output, .. } => {
+                    // Figure out the monitor following a similar logic to initial configure.
+                    // FIXME: deduplicate.
+                    let mon = requested_output
+                        .as_ref()
+                        // If none requested, try currently configured output.
+                        .or(output.as_ref())
+                        .and_then(|o| self.niri.layout.monitor_for_output(o))
+                        .map(|mon| (mon, false))
+                        // If not, check if we have a parent with a monitor.
+                        .or_else(|| {
+                            toplevel
+                                .parent()
+                                .and_then(|parent| self.niri.layout.find_window_and_output(&parent))
+                                .and_then(|(_win, output)| output)
+                                .and_then(|o| self.niri.layout.monitor_for_output(o))
+                                .map(|mon| (mon, true))
+                        })
+                        // If not, fall back to the active monitor.
+                        .or_else(|| {
+                            self.niri
+                                .layout
+                                .active_monitor_ref()
+                                .map(|mon| (mon, false))
+                        });
+
+                    *output = mon
+                        .filter(|(_, parent)| !parent)
+                        .map(|(mon, _)| mon.output().clone());
+                    let mon = mon.map(|(mon, _)| mon);
+
+                    let ws = mon
+                        .map(|mon| mon.active_workspace_ref())
+                        .or_else(|| self.niri.layout.active_workspace());
+
+                    if let Some(ws) = ws {
+                        toplevel.with_pending_state(|state| {
+                            state.states.set(xdg_toplevel::State::Fullscreen);
+                            state.states.unset(xdg_toplevel::State::Maximized);
+                        });
+                        ws.configure_new_window(&unmapped.window, None, None, false, rules);
+                    }
+
+                    // We already sent the initial configure, so we need to reconfigure.
+                    toplevel.send_configure();
+                }
+            }
+        } else {
+            error!("couldn't find the toplevel in fullscreen_request()");
+            toplevel.send_configure();
+        }
+    }
+
+    fn unfullscreen_request(&mut self, toplevel: ToplevelSurface) {
+        if let Some((mapped, _)) = self
+            .niri
+            .layout
+            .find_window_and_output_mut(toplevel.wl_surface())
+        {
+            // A configure is required in response to this event regardless if there are pending
+            // changes.
+            mapped.set_needs_configure();
+
+            let window = mapped.window.clone();
+            self.niri.layout.set_fullscreen(&window, false);
+        } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
+            match &mut unmapped.state {
+                InitialConfigureState::NotConfigured {
+                    wants_fullscreen, ..
+                } => {
+                    *wants_fullscreen = None;
+
+                    // The required configure will be the initial configure.
+                }
+                InitialConfigureState::Configured {
+                    rules,
+                    width,
+                    height,
+                    floating_width,
+                    floating_height,
+                    is_full_width,
+                    output,
+                    workspace_name,
+                    is_pending_maximized,
+                } => {
+                    // Figure out the monitor following a similar logic to initial configure.
+                    // FIXME: deduplicate.
+                    let mon = workspace_name
+                        .as_deref()
+                        .and_then(|name| self.niri.layout.monitor_for_workspace(name))
+                        .map(|mon| (mon, false));
+
+                    let mon = mon.or_else(|| {
+                        output
+                            .as_ref()
+                            .and_then(|o| self.niri.layout.monitor_for_output(o))
+                            .map(|mon| (mon, false))
+                            // If not, check if we have a parent with a monitor.
+                            .or_else(|| {
+                                toplevel
+                                    .parent()
+                                    .and_then(|parent| {
+                                        self.niri.layout.find_window_and_output(&parent)
+                                    })
+                                    .and_then(|(_win, output)| output)
+                                    .and_then(|o| self.niri.layout.monitor_for_output(o))
+                                    .map(|mon| (mon, true))
+                            })
+                            // If not, fall back to the active monitor.
+                            .or_else(|| {
+                                self.niri
+                                    .layout
+                                    .active_monitor_ref()
+                                    .map(|mon| (mon, false))
+                            })
+                    });
+
+                    *output = mon
+                        .filter(|(_, parent)| !parent)
+                        .map(|(mon, _)| mon.output().clone());
                     let mon = mon.map(|(mon, _)| mon);
 
                     let ws = workspace_name
@@ -427,14 +836,32 @@ impl XdgShellHandler for State {
                     if let Some(ws) = ws {
                         toplevel.with_pending_state(|state| {
                             state.states.unset(xdg_toplevel::State::Fullscreen);
+
+                            if *is_pending_maximized {
+                                state.states.set(xdg_toplevel::State::Maximized);
+                            }
                         });
 
-                        let configure_width = if *is_full_width {
-                            Some(ColumnWidth::Proportion(1.))
+                        let is_floating = rules.compute_open_floating(&toplevel);
+                        let configure_width = if is_floating {
+                            *floating_width
+                        } else if *is_full_width {
+                            Some(PresetSize::Proportion(1.))
                         } else {
                             *width
                         };
-                        ws.configure_new_window(&unmapped.window, configure_width, rules);
+                        let configure_height = if is_floating {
+                            *floating_height
+                        } else {
+                            *height
+                        };
+                        ws.configure_new_window(
+                            &unmapped.window,
+                            configure_width,
+                            configure_height,
+                            is_floating,
+                            rules,
+                        );
                     }
 
                     // We already sent the initial configure, so we need to reconfigure.
@@ -470,33 +897,51 @@ impl XdgShellHandler for State {
             return;
         };
         let window = mapped.window.clone();
-        let output = output.clone();
+        let output = output.cloned();
 
-        #[cfg(feature = "xdp-gnome-screencast")]
+        let id = mapped.id();
         self.niri
-            .stop_casts_for_target(crate::pw_utils::CastTarget::Window {
-                id: u64::from(mapped.id().get()),
-            });
+            .stop_casts_for_target(CastTarget::Window { id: id.get() });
 
-        self.backend.with_primary_renderer(|renderer| {
-            self.niri.layout.store_unmap_snapshot(renderer, &window);
-        });
+        self.store_unmap_snapshot(&window, output.as_ref());
+
+        let transaction = Transaction::new();
+        let blocker = transaction.blocker();
         self.backend.with_primary_renderer(|renderer| {
             self.niri
                 .layout
-                .start_close_animation_for_window(renderer, &window);
+                .start_close_animation_for_window(renderer, &window, blocker);
         });
 
-        let active_window = self.niri.layout.active_window().map(|(m, _)| &m.window);
+        let active_window = self.niri.layout.focus().map(|m| &m.window);
         let was_active = active_window == Some(&window);
 
-        self.niri.layout.remove_window(&window);
+        self.niri.window_mru_ui.remove_window(id);
+        self.niri.layout.remove_window(&window, transaction.clone());
+
+        let surface = surface.wl_surface();
+        // This check is necessary because implicit resource destruction is done with
+        // undefined order, so the surface might get destroyed before toplevel_destroyed() is
+        // called. In this case, adding the default pre-commit hook here would leak it, since the
+        // place that removes it is WlSurface::destroyed(), which had already been called by now.
+        if surface.is_alive() {
+            self.add_default_dmabuf_pre_commit_hook(surface);
+        }
+
+        // If this is the only instance, then this transaction will complete immediately, so no
+        // need to set the timer.
+        if !transaction.is_last() {
+            transaction.register_deadline_timer(&self.niri.event_loop);
+        }
 
         if was_active {
             self.maybe_warp_cursor_to_focus();
         }
 
-        self.niri.queue_redraw(&output);
+        if let Some(output) = output {
+            self.niri.queue_redraw(&output);
+            self.niri.queue_redraw_mru_output();
+        }
     }
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
@@ -512,9 +957,23 @@ impl XdgShellHandler for State {
     fn title_changed(&mut self, toplevel: ToplevelSurface) {
         self.update_window_rules(&toplevel);
     }
-}
 
-delegate_xdg_shell!(State);
+    fn parent_changed(&mut self, toplevel: ToplevelSurface) {
+        let Some(parent) = toplevel.parent() else {
+            return;
+        };
+
+        if let Some((mapped, output)) = self.niri.layout.find_window_and_output_mut(&parent) {
+            let output = output.cloned();
+            let window = mapped.window.clone();
+            if self.niri.layout.descendants_added(&window) {
+                if let Some(output) = output {
+                    self.niri.queue_redraw(&output);
+                }
+            }
+        }
+    }
+}
 
 impl XdgDecorationHandler for State {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
@@ -539,8 +998,14 @@ impl XdgDecorationHandler for State {
 
         // A configure is required in response to this event. However, if an initial configure
         // wasn't sent, then we will send this as part of the initial configure later.
-        if initial_configure_sent(&toplevel) {
-            toplevel.send_configure();
+        if toplevel.is_initial_configure_sent() {
+            // If this is a mapped window, flag it as needs configure to avoid duplicate configures.
+            let surface = toplevel.wl_surface();
+            if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
+                mapped.set_needs_configure();
+            } else {
+                toplevel.send_configure();
+            }
         }
     }
 
@@ -552,15 +1017,20 @@ impl XdgDecorationHandler for State {
 
         // A configure is required in response to this event. However, if an initial configure
         // wasn't sent, then we will send this as part of the initial configure later.
-        if initial_configure_sent(&toplevel) {
-            toplevel.send_configure();
+        if toplevel.is_initial_configure_sent() {
+            // If this is a mapped window, flag it as needs configure to avoid duplicate configures.
+            let surface = toplevel.wl_surface();
+            if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
+                mapped.set_needs_configure();
+            } else {
+                toplevel.send_configure();
+            }
         }
     }
 }
-delegate_xdg_decoration!(State);
 
 /// Whether KDE server decorations are in use.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct KdeDecorationsModeState {
     server: Cell<bool>,
 }
@@ -598,25 +1068,11 @@ impl KdeDecorationHandler for State {
         });
     }
 }
-delegate_kde_decoration!(State);
 
 impl XdgForeignHandler for State {
     fn xdg_foreign_state(&mut self) -> &mut XdgForeignState {
         &mut self.niri.xdg_foreign_state
     }
-}
-delegate_xdg_foreign!(State);
-
-fn initial_configure_sent(toplevel: &ToplevelSurface) -> bool {
-    with_states(toplevel.wl_surface(), |states| {
-        states
-            .data_map
-            .get::<XdgToplevelSurfaceData>()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .initial_configure_sent
-    })
 }
 
 impl State {
@@ -635,9 +1091,13 @@ impl State {
             self.niri.is_at_startup,
         );
 
-        let Unmapped { window, state } = unmapped;
+        let Unmapped { window, state, .. } = unmapped;
 
-        let InitialConfigureState::NotConfigured { wants_fullscreen } = state else {
+        let InitialConfigureState::NotConfigured {
+            wants_fullscreen,
+            wants_maximized,
+        } = state
+        else {
             error!("window must not be already configured in send_initial_configure()");
             return;
         };
@@ -653,7 +1113,12 @@ impl State {
             rules
                 .open_on_output
                 .as_deref()
-                .and_then(|name| self.niri.output_by_name.get(name))
+                .and_then(|name| {
+                    self.niri
+                        .global_space
+                        .outputs()
+                        .find(|output| output_matches_name(output, name))
+                })
                 .and_then(|o| self.niri.layout.monitor_for_output(o))
         });
 
@@ -671,7 +1136,7 @@ impl State {
             toplevel
                 .parent()
                 .and_then(|parent| self.niri.layout.find_window_and_output(&parent))
-                .map(|(_win, output)| output)
+                .and_then(|(_win, output)| output)
                 .and_then(|o| self.niri.layout.monitor_for_output(o))
                 .map(|mon| (mon, true))
         });
@@ -688,11 +1153,15 @@ impl State {
         // mapped, it fetches the possibly changed parent's output again, and shows up there.
         let output = mon
             .filter(|(_, parent)| !parent)
-            .map(|(mon, _)| mon.output.clone());
+            .map(|(mon, _)| mon.output().clone());
         let mon = mon.map(|(mon, _)| mon);
 
         let mut width = None;
+        let mut floating_width = None;
+        let mut height = None;
+        let mut floating_height = None;
         let is_full_width = rules.open_maximized.unwrap_or(false);
+        let is_floating = rules.compute_open_floating(toplevel);
 
         // Tell the surface the preferred size and bounds for its likely output.
         let ws = rules
@@ -704,46 +1173,63 @@ impl State {
                     .or_else(|| self.niri.layout.active_workspace())
             });
 
+        let mut is_pending_maximized = false;
         if let Some(ws) = ws {
-            // Set a fullscreen state based on window request and window rule.
+            // Set a fullscreen and maximized state based on window request and window rule.
+            is_pending_maximized = (*wants_maximized && rules.open_maximized_to_edges.is_none())
+                || rules.open_maximized_to_edges == Some(true);
+
             if (wants_fullscreen.is_some() && rules.open_fullscreen.is_none())
                 || rules.open_fullscreen == Some(true)
             {
                 toplevel.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Fullscreen);
                 });
+            } else if is_pending_maximized {
+                toplevel.with_pending_state(|state| {
+                    state.states.set(xdg_toplevel::State::Maximized);
+                });
             }
 
-            width = ws.resolve_default_width(rules.default_width);
+            width = ws.resolve_default_width(rules.default_width, false);
+            floating_width = ws.resolve_default_width(rules.default_width, true);
+            height = ws.resolve_default_height(rules.default_height, false);
+            floating_height = ws.resolve_default_height(rules.default_height, true);
 
-            let configure_width = if is_full_width {
-                Some(ColumnWidth::Proportion(1.))
+            let configure_width = if is_floating {
+                floating_width
+            } else if is_full_width {
+                Some(PresetSize::Proportion(1.))
             } else {
                 width
             };
-            ws.configure_new_window(window, configure_width, &rules);
+            let configure_height = if is_floating { floating_height } else { height };
+            ws.configure_new_window(
+                window,
+                configure_width,
+                configure_height,
+                is_floating,
+                &rules,
+            );
         }
 
-        // If the user prefers no CSD, it's a reasonable assumption that they would prefer to get
-        // rid of the various client-side rounded corners also by using the tiled state.
-        if config.prefer_no_csd {
-            toplevel.with_pending_state(|state| {
-                state.states.set(xdg_toplevel::State::TiledLeft);
-                state.states.set(xdg_toplevel::State::TiledRight);
-                state.states.set(xdg_toplevel::State::TiledTop);
-                state.states.set(xdg_toplevel::State::TiledBottom);
-            });
-        }
+        // Set the tiled state for the initial configure.
+        update_tiled_state(toplevel, config.prefer_no_csd, rules.tiled_state);
 
         // Set the configured settings.
         *state = InitialConfigureState::Configured {
             rules,
             width,
+            height,
+            floating_width,
+            floating_height,
             is_full_width,
             output,
-            workspace_name: ws.and_then(|w| w.name.clone()),
+            workspace_name: ws.and_then(|w| w.name().cloned()),
+            is_pending_maximized,
         };
 
+        trace!(surface = %toplevel.wl_surface().id(), "sending initial configure");
         toplevel.send_configure();
     }
 
@@ -770,16 +1256,7 @@ impl State {
         if let Some(popup) = self.niri.popups.find_popup(surface) {
             match popup {
                 PopupKind::Xdg(ref popup) => {
-                    let initial_configure_sent = with_states(surface, |states| {
-                        states
-                            .data_map
-                            .get::<XdgPopupSurfaceData>()
-                            .unwrap()
-                            .lock()
-                            .unwrap()
-                            .initial_configure_sent
-                    });
-                    if !initial_configure_sent {
+                    if !popup.is_initial_configure_sent() {
                         if let Some(output) = self.output_for_popup(&PopupKind::Xdg(popup.clone()))
                         {
                             let scale = output.current_scale();
@@ -815,8 +1292,8 @@ impl State {
         };
 
         // Figure out if the root is a window or a layer surface.
-        if let Some((mapped, output)) = self.niri.layout.find_window_and_output(&root) {
-            self.unconstrain_window_popup(popup, &mapped.window, output);
+        if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&root) {
+            self.unconstrain_window_popup(popup, &mapped.window);
         } else if let Some((layer_surface, output)) = self.niri.layout.outputs().find_map(|o| {
             let map = layer_map_for_output(o);
             let layer_surface = map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)?;
@@ -826,22 +1303,13 @@ impl State {
         }
     }
 
-    fn unconstrain_window_popup(&self, popup: &PopupKind, window: &Window, output: &Output) {
-        let window_geo = window.geometry();
-        let output_geo = self.niri.global_space.output_geometry(output).unwrap();
-
+    fn unconstrain_window_popup(&self, popup: &PopupKind, window: &Window) {
         // The target geometry for the positioner should be relative to its parent's geometry, so
         // we will compute that here.
-        //
-        // We try to keep regular window popups within the window itself horizontally (since the
-        // window can be scrolled to both edges of the screen), but within the whole monitor's
-        // height.
-        let mut target =
-            Rectangle::from_loc_and_size((0, 0), (window_geo.size.w, output_geo.size.h)).to_f64();
-        target.loc -= self.niri.layout.window_loc(window).unwrap();
+        let mut target = self.niri.layout.popup_target_rect(window);
         target.loc -= get_popup_toplevel_coords(popup).to_f64();
 
-        self.position_popup_within_rect(popup, target);
+        self.position_popup_within_rect(popup, target, true);
     }
 
     pub fn unconstrain_layer_shell_popup(
@@ -858,18 +1326,43 @@ impl State {
 
         // The target geometry for the positioner should be relative to its parent's geometry, so
         // we will compute that here.
-        let mut target = Rectangle::from_loc_and_size((0, 0), output_geo.size);
+        let mut target = Rectangle::from_size(output_geo.size);
+
+        // Background and bottom layer popups render below the top and the overlay layer, so let's
+        // put them into the non-exclusive zone.
+        //
+        // FIXME: ideally this should use the "top and overlay layer" non-exclusive zone, but
+        // Smithay only computes the "all layers" non-exclusive zone atm.
+        //
+        // FIXME: related to the above, top layer popups should use the "overlay layer"
+        // non-exclusive zone.
+        if matches!(layer_surface.layer(), Layer::Background | Layer::Bottom) {
+            target = map.non_exclusive_zone();
+        }
+
         target.loc -= layer_geo.loc;
         target.loc -= get_popup_toplevel_coords(popup);
 
-        self.position_popup_within_rect(popup, target.to_f64());
+        // Don't add padding to layer-shell popups. It's not really needed, and it's unexpected.
+        self.position_popup_within_rect(popup, target.to_f64(), false);
     }
 
-    fn position_popup_within_rect(&self, popup: &PopupKind, target: Rectangle<f64, Logical>) {
+    fn position_popup_within_rect(
+        &self,
+        popup: &PopupKind,
+        target: Rectangle<f64, Logical>,
+        padding: bool,
+    ) {
         match popup {
             PopupKind::Xdg(popup) => {
                 popup.with_pending_state(|state| {
-                    state.geometry = unconstrain_with_padding(state.positioner, target);
+                    state.geometry = if padding {
+                        unconstrain_with_padding(state.positioner, target)
+                    } else {
+                        state
+                            .positioner
+                            .get_unconstrained_geometry(target.to_i32_round())
+                    };
                 });
             }
             PopupKind::InputMethod(popup) => {
@@ -903,7 +1396,7 @@ impl State {
         }
     }
 
-    pub fn update_reactive_popups(&self, window: &Window, output: &Output) {
+    pub fn update_reactive_popups(&self, window: &Window) {
         let _span = tracy_client::span!("Niri::update_reactive_popups");
 
         for (popup, _) in PopupManager::popups_for_surface(
@@ -912,7 +1405,7 @@ impl State {
             match &popup {
                 xdg_popup @ PopupKind::Xdg(popup) => {
                     if popup.with_pending_state(|state| state.positioner.reactive) {
-                        self.unconstrain_window_popup(xdg_popup, window, output);
+                        self.unconstrain_window_popup(xdg_popup, window);
                         if let Err(err) = popup.send_pending_configure() {
                             warn!("error re-configuring reactive popup: {err:?}");
                         }
@@ -999,16 +1492,25 @@ fn unconstrain_with_padding(
 pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId {
     add_pre_commit_hook::<State, _>(toplevel.wl_surface(), move |state, _dh, surface| {
         let _span = tracy_client::span!("mapped toplevel pre-commit");
+        let span =
+            trace_span!("toplevel pre-commit", surface = %surface.id(), serial = Empty).entered();
 
-        let Some((mapped, _)) = state.niri.layout.find_window_and_output_mut(surface) else {
+        let Some((mapped, output)) = state.niri.layout.find_window_and_output_mut(surface) else {
             error!("pre-commit hook for mapped surfaces must be removed upon unmapping");
             return;
         };
 
-        let (got_unmapped, commit_serial) = with_states(surface, |states| {
-            let got_unmapped = {
+        let (got_unmapped, dmabuf, commit_serial) = with_states(surface, |states| {
+            let (got_unmapped, dmabuf) = {
                 let mut guard = states.cached_state.get::<SurfaceAttributes>();
-                matches!(guard.pending().buffer, Some(BufferAssignment::Removed))
+                match guard.pending().buffer.as_ref() {
+                    Some(BufferAssignment::NewBuffer(buffer)) => {
+                        let dmabuf = get_dmabuf(buffer).cloned().ok();
+                        (false, dmabuf)
+                    }
+                    Some(BufferAssignment::Removed) => (true, None),
+                    None => (false, None),
+                }
             };
 
             let role = states
@@ -1017,22 +1519,86 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
                 .unwrap()
                 .lock()
                 .unwrap();
+            let serial = role.last_acked.as_ref().map(|c| c.serial);
 
-            (got_unmapped, role.configure_serial)
+            (got_unmapped, dmabuf, serial)
         });
 
-        let animate = if let Some(serial) = commit_serial {
-            mapped.should_animate_commit(serial)
-        } else {
+        let mut transaction_for_dmabuf = None;
+        let mut animate = false;
+        if let Some(serial) = commit_serial {
+            if !span.is_disabled() {
+                span.record("serial", format!("{serial:?}"));
+            }
+
+            // trace!("taking pending transaction");
+            if let Some(transaction) = mapped.take_pending_transaction(serial) {
+                // Transaction can be already completed if it ran past the deadline.
+                let disable = state.niri.config.borrow().debug.disable_transactions;
+                if !transaction.is_completed() && !disable {
+                    // Register the deadline even if this is the last pending, since dmabuf
+                    // rendering can still run over the deadline.
+                    transaction.register_deadline_timer(&state.niri.event_loop);
+
+                    let is_last = transaction.is_last();
+
+                    // If this is the last transaction, we don't need to add a separate
+                    // notification, because the transaction will complete in our dmabuf blocker
+                    // callback, which already calls blocker_cleared(), or by the end of this
+                    // function, in which case there would be no blocker in the first place.
+                    if !is_last {
+                        // Waiting for some other surface; register a notification and add a
+                        // transaction blocker.
+                        if let Some(client) = surface.client() {
+                            transaction.add_notification(
+                                state.niri.blocker_cleared_tx.clone(),
+                                client.clone(),
+                            );
+                            add_blocker(surface, transaction.blocker());
+                        }
+                    }
+
+                    // Delay dropping (and completing) the transaction until the dmabuf is ready.
+                    // If there's no dmabuf, this will be dropped by the end of this pre-commit
+                    // hook.
+                    transaction_for_dmabuf = Some(transaction);
+                }
+            }
+
+            animate = mapped.should_animate_commit(serial);
+        } else if !got_unmapped {
             error!("commit on a mapped surface without a configured serial");
-            false
         };
+
+        if let Some((blocker, source)) =
+            dmabuf.and_then(|dmabuf| dmabuf.generate_blocker(Interest::READ).ok())
+        {
+            if let Some(client) = surface.client() {
+                let res = state
+                    .niri
+                    .event_loop
+                    .insert_source(source, move |_, _, state| {
+                        // This surface is now ready for the transaction.
+                        drop(transaction_for_dmabuf.take());
+
+                        let display_handle = state.niri.display_handle.clone();
+                        state
+                            .client_compositor_state(&client)
+                            .blocker_cleared(state, &display_handle);
+
+                        Ok(())
+                    });
+                if res.is_ok() {
+                    add_blocker(surface, blocker);
+                    trace!("added dmabuf blocker");
+                }
+            }
+        }
 
         let window = mapped.window.clone();
         if got_unmapped {
-            state.backend.with_primary_renderer(|renderer| {
-                state.niri.layout.store_unmap_snapshot(renderer, &window);
-            });
+            let output = output.cloned();
+            state.store_unmap_snapshot(&window, output.as_ref());
         } else {
             if animate {
                 state.backend.with_primary_renderer(|renderer| {

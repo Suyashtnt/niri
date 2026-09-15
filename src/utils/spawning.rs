@@ -9,12 +9,14 @@ use std::{io, thread};
 use atomic::Atomic;
 use libc::{getrlimit, rlim_t, rlimit, setrlimit, RLIMIT_NOFILE};
 use niri_config::Environment;
+use smithay::wayland::xdg_activation::XdgActivationToken;
 
 use crate::utils::expand_home;
 
 pub static REMOVE_ENV_RUST_BACKTRACE: AtomicBool = AtomicBool::new(false);
 pub static REMOVE_ENV_RUST_LIB_BACKTRACE: AtomicBool = AtomicBool::new(false);
 pub static CHILD_ENV: RwLock<Environment> = RwLock::new(Environment(Vec::new()));
+pub static CHILD_DISPLAY: RwLock<Option<String>> = RwLock::new(None);
 
 static ORIGINAL_NOFILE_RLIMIT_CUR: Atomic<rlim_t> = Atomic::new(0);
 static ORIGINAL_NOFILE_RLIMIT_MAX: Atomic<rlim_t> = Atomic::new(0);
@@ -61,7 +63,7 @@ pub fn restore_nofile_rlimit() {
 }
 
 /// Spawns the command to run independently of the compositor.
-pub fn spawn<T: AsRef<OsStr> + Send + 'static>(command: Vec<T>) {
+pub fn spawn<T: AsRef<OsStr> + Send + 'static>(command: Vec<T>, token: Option<XdgActivationToken>) {
     let _span = tracy_client::span!();
 
     if command.is_empty() {
@@ -73,7 +75,7 @@ pub fn spawn<T: AsRef<OsStr> + Send + 'static>(command: Vec<T>) {
         .name("Command Spawner".to_owned())
         .spawn(move || {
             let (command, args) = command.split_first().unwrap();
-            spawn_sync(command, args);
+            spawn_sync(command, args, token);
         });
 
     if let Err(err) = res {
@@ -81,7 +83,21 @@ pub fn spawn<T: AsRef<OsStr> + Send + 'static>(command: Vec<T>) {
     }
 }
 
-fn spawn_sync(command: impl AsRef<OsStr>, args: impl IntoIterator<Item = impl AsRef<OsStr>>) {
+/// Spawns the command through the shell.
+///
+/// We hardcode `sh -c`, consistent with other compositors:
+///
+/// - https://github.com/swaywm/sway/blob/b3dcde8d69c3f1304b076968a7a64f54d0c958be/sway/commands/exec_always.c#L64
+/// - https://github.com/hyprwm/Hyprland/blob/1ac1ff457ab8ef1ae6a8f2ab17ee7965adfa729f/src/managers/KeybindManager.cpp#L987
+pub fn spawn_sh(command: String, token: Option<XdgActivationToken>) {
+    spawn(vec![String::from("sh"), String::from("-c"), command], token);
+}
+
+fn spawn_sync(
+    command: impl AsRef<OsStr>,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+    token: Option<XdgActivationToken>,
+) {
     let _span = tracy_client::span!();
 
     let mut command = command.as_ref();
@@ -111,6 +127,17 @@ fn spawn_sync(command: impl AsRef<OsStr>, args: impl IntoIterator<Item = impl As
         process.env_remove("RUST_LIB_BACKTRACE");
     }
 
+    // Remove the systemd NOTIFY_SOCKET variable.
+    process.env_remove("NOTIFY_SOCKET");
+
+    // Set DISPLAY if needed.
+    let display = CHILD_DISPLAY.read().unwrap();
+    if let Some(display) = &*display {
+        process.env("DISPLAY", display);
+    } else {
+        process.env_remove("DISPLAY");
+    }
+
     // Set configured environment.
     let env = CHILD_ENV.read().unwrap();
     for var in &env.0 {
@@ -121,6 +148,13 @@ fn spawn_sync(command: impl AsRef<OsStr>, args: impl IntoIterator<Item = impl As
         }
     }
     drop(env);
+
+    if let Some(token) = token.as_ref() {
+        process.env("XDG_ACTIVATION_TOKEN", token.as_str());
+        process.env("DESKTOP_STARTUP_ID", token.as_str());
+    }
+
+    unsafe { process.pre_exec(crate::utils::signals::unblock_all) };
 
     let Some(mut child) = do_spawn(command, process) else {
         return;
@@ -180,7 +214,22 @@ mod systemd {
     use super::*;
 
     pub fn do_spawn(command: &OsStr, mut process: Command) -> Option<Child> {
+        #[cfg(target_env = "gnu")]
         use libc::close_range;
+        #[cfg(target_os = "openbsd")]
+        use libc::closefrom;
+
+        #[cfg(not(target_env = "gnu"))] // musl
+        pub fn close_range(first: libc::c_uint, last: libc::c_uint, flags: libc::c_uint) -> i64 {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_close_range,
+                    first as usize,
+                    last as usize,
+                    flags as usize,
+                )
+            }
+        }
 
         // When running as a systemd session, we want to put children into their own transient
         // scopes in order to separate them from the niri process. This is helpful for
@@ -234,7 +283,7 @@ mod systemd {
                     close(fd);
                 }
 
-                // Convert the our FDs to OwnedFd, which will close them in all of our fork paths.
+                // Convert the FDs to OwnedFd, which will close them in all of our fork paths.
                 let pipe_pid_write = pipe_pid_write_fd.take().map(|fd| OwnedFd::from_raw_fd(fd));
                 let pipe_wait_read = pipe_wait_read_fd.take().map(|fd| OwnedFd::from_raw_fd(fd));
 
@@ -251,9 +300,20 @@ mod systemd {
                         if let Some(pipe) = pipe_wait_read {
                             // We're going to exit afterwards. Close all other FDs to allow
                             // Command::spawn() to return in the parent process.
-                            let raw = pipe.as_raw_fd() as u32;
-                            let _ = close_range(0, raw - 1, 0);
-                            let _ = close_range(raw + 1, !0, 0);
+                            #[cfg(not(target_os = "openbsd"))]
+                            {
+                                let raw = pipe.as_raw_fd() as u32;
+                                let _ = close_range(0, raw - 1, 0);
+                                let _ = close_range(raw + 1, !0, 0);
+                            }
+                            #[cfg(target_os = "openbsd")]
+                            {
+                                let raw = pipe.as_raw_fd();
+                                for fd in 0..raw {
+                                    close(fd);
+                                }
+                                closefrom(raw + 1);
+                            }
 
                             let _ = read_all(pipe, &mut [0]);
                         }
@@ -288,7 +348,6 @@ mod systemd {
                     trace!("spawned PID: {pid}");
 
                     // Start a systemd scope for the grandchild.
-                    #[cfg(feature = "systemd")]
                     if let Err(err) = start_systemd_scope(command, child.id(), pid as u32) {
                         trace!("error starting systemd scope for spawned command: {err:?}");
                     }
@@ -307,7 +366,6 @@ mod systemd {
         Some(child)
     }
 
-    #[cfg(feature = "systemd")]
     fn write_all(fd: impl AsFd, buf: &[u8]) -> rustix::io::Result<()> {
         let mut written = 0;
         loop {
@@ -323,7 +381,6 @@ mod systemd {
         }
     }
 
-    #[cfg(feature = "systemd")]
     fn read_all(fd: impl AsFd, buf: &mut [u8]) -> rustix::io::Result<()> {
         let mut start = 0;
         loop {
@@ -343,7 +400,6 @@ mod systemd {
     ///
     /// This separates the pid from the compositor scope, which for example prevents the OOM killer
     /// from bringing down the compositor together with a misbehaving client.
-    #[cfg(feature = "systemd")]
     fn start_systemd_scope(
         name: &OsStr,
         intermediate_pid: u32,
@@ -414,8 +470,9 @@ mod systemd {
 
         trace!("waiting for JobRemoved");
         for message in signals {
+            let body = message.body();
             let body: (u32, OwnedObjectPath, &str, &str) =
-                message.body().context("error parsing signal")?;
+                body.deserialize().context("error parsing signal")?;
 
             if body.1 == job {
                 // Our transient unit had started, we're good to exit the intermediate child.

@@ -1,16 +1,14 @@
 use std::f32::consts::{FRAC_PI_4, PI};
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use niri::animation::ANIMATION_SLOWDOWN;
 use niri::layout::focus_ring::FocusRing;
 use niri::render_helpers::border::BorderRenderElement;
-use niri_config::{Color, CornerRadius, FloatOrInt, GradientInterpolation};
+use niri_config::{Color, CornerRadius, GradientInterpolation};
 use smithay::backend::renderer::element::RenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
+use smithay::utils::{Physical, Point, Rectangle, Size};
 
-use super::TestCase;
+use super::{Args, TestCase};
 
 pub struct GradientArea {
     progress: f32,
@@ -19,14 +17,16 @@ pub struct GradientArea {
 }
 
 impl GradientArea {
-    pub fn new(_size: Size<i32, Logical>) -> Self {
+    pub fn new(_args: Args) -> Self {
         let border = FocusRing::new(niri_config::FocusRing {
             off: false,
-            width: FloatOrInt(1.),
+            width: 1.,
             active_color: Color::from_rgba8_unpremul(255, 255, 255, 128),
             inactive_color: Color::default(),
+            urgent_color: Color::default(),
             active_gradient: None,
             inactive_gradient: None,
+            urgent_gradient: None,
         });
 
         Self {
@@ -43,19 +43,12 @@ impl TestCase for GradientArea {
     }
 
     fn advance_animations(&mut self, current_time: Duration) {
-        let mut delta = if self.prev_time.is_zero() {
+        let delta = if self.prev_time.is_zero() {
             Duration::ZERO
         } else {
             current_time.saturating_sub(self.prev_time)
         };
         self.prev_time = current_time;
-
-        let slowdown = ANIMATION_SLOWDOWN.load(Ordering::SeqCst);
-        if slowdown == 0. {
-            delta = Duration::ZERO
-        } else {
-            delta = delta.div_f64(slowdown);
-        }
 
         self.progress += delta.as_secs_f32() * PI;
 
@@ -74,8 +67,8 @@ impl TestCase for GradientArea {
         let f = (self.progress.sin() + 1.) / 2.;
 
         let (a, b) = (size.w / 4, size.h / 4);
-        let rect_size = (size.w - a * 2, size.h - b * 2);
-        let area = Rectangle::from_loc_and_size((a, b), rect_size).to_f64();
+        let rect_size = Size::from((size.w - a * 2, size.h - b * 2));
+        let area = Rectangle::new(Point::from((a, b)), rect_size).to_f64();
 
         let g_size = Size::from((
             (size.w as f32 / 8. + size.w as f32 / 8. * 7. * f).round() as i32,
@@ -83,22 +76,21 @@ impl TestCase for GradientArea {
         ));
         let g_loc = Point::from(((size.w - g_size.w) / 2, (size.h - g_size.h) / 2)).to_f64();
         let g_size = g_size.to_f64();
-        let mut g_area = Rectangle::from_loc_and_size(g_loc, g_size);
+        let mut g_area = Rectangle::new(g_loc, g_size);
         g_area.loc -= area.loc;
 
         self.border.update_render_elements(
             g_size,
             true,
             true,
+            false,
             Rectangle::default(),
             CornerRadius::default(),
             1.,
+            1.,
         );
-        rv.extend(
-            self.border
-                .render(renderer, g_loc)
-                .map(|elem| Box::new(elem) as _),
-        );
+        self.border
+            .render(renderer, g_loc, &mut |elem| rv.push(Box::new(elem) as _));
 
         rv.extend(
             [BorderRenderElement::new(
@@ -108,9 +100,10 @@ impl TestCase for GradientArea {
                 Color::new_unpremul(1., 0., 0., 1.),
                 Color::new_unpremul(0., 1., 0., 1.),
                 FRAC_PI_4,
-                Rectangle::from_loc_and_size((0, 0), rect_size).to_f64(),
+                Rectangle::from_size(rect_size).to_f64(),
                 0.,
                 CornerRadius::default(),
+                1.,
                 1.,
             )
             .with_location(area.loc)]

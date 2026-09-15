@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use niri_config::{Config, ModKey};
 use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::drm::DrmNode;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
-use crate::input::CompositorMod;
 use crate::niri::Niri;
 use crate::utils::id::IdCounter;
 
@@ -17,9 +18,14 @@ pub use tty::Tty;
 pub mod winit;
 pub use winit::Winit;
 
+pub mod headless;
+pub use headless::Headless;
+
+#[allow(clippy::large_enum_variant)]
 pub enum Backend {
     Tty(Tty),
     Winit(Winit),
+    Headless(Headless),
 }
 
 #[derive(PartialEq, Eq)]
@@ -37,23 +43,25 @@ pub type IpcOutputMap = HashMap<OutputId, niri_ipc::Output>;
 static OUTPUT_ID_COUNTER: IdCounter = IdCounter::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct OutputId(u32);
+pub struct OutputId(u64);
 
 impl OutputId {
     fn next() -> OutputId {
         OutputId(OUTPUT_ID_COUNTER.next())
     }
 
-    pub fn get(self) -> u32 {
+    pub fn get(self) -> u64 {
         self.0
     }
 }
 
 impl Backend {
     pub fn init(&mut self, niri: &mut Niri) {
+        let _span = tracy_client::span!("Backend::init");
         match self {
             Backend::Tty(tty) => tty.init(niri),
             Backend::Winit(winit) => winit.init(niri),
+            Backend::Headless(headless) => headless.init(niri),
         }
     }
 
@@ -61,6 +69,7 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.seat_name(),
             Backend::Winit(winit) => winit.seat_name(),
+            Backend::Headless(headless) => headless.seat_name(),
         }
     }
 
@@ -71,6 +80,19 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.with_primary_renderer(f),
             Backend::Winit(winit) => winit.with_primary_renderer(f),
+            Backend::Headless(headless) => headless.with_primary_renderer(f),
+        }
+    }
+
+    /// DRM render node of the primary renderer, if it has one.
+    ///
+    /// This is the node clients should allocate dma-bufs on for the primary renderer to import
+    /// and render into them directly.
+    pub fn primary_render_node(&mut self) -> Option<DrmNode> {
+        match self {
+            Backend::Tty(tty) => tty.primary_render_node(),
+            Backend::Winit(winit) => winit.primary_render_node(),
+            Backend::Headless(headless) => headless.primary_render_node(),
         }
     }
 
@@ -83,13 +105,20 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.render(niri, output, target_presentation_time),
             Backend::Winit(winit) => winit.render(niri, output),
+            Backend::Headless(headless) => headless.render(niri, output),
         }
     }
 
-    pub fn mod_key(&self) -> CompositorMod {
+    pub fn mod_key(&self, config: &Config) -> ModKey {
         match self {
-            Backend::Tty(_) => CompositorMod::Super,
-            Backend::Winit(_) => CompositorMod::Alt,
+            Backend::Winit(_) => config.input.mod_key_nested.unwrap_or({
+                if let Some(ModKey::Alt) = config.input.mod_key {
+                    ModKey::Super
+                } else {
+                    ModKey::Alt
+                }
+            }),
+            Backend::Tty(_) | Backend::Headless(_) => config.input.mod_key.unwrap_or(ModKey::Super),
         }
     }
 
@@ -97,6 +126,7 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.change_vt(vt),
             Backend::Winit(_) => (),
+            Backend::Headless(_) => (),
         }
     }
 
@@ -104,6 +134,7 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.suspend(),
             Backend::Winit(_) => (),
+            Backend::Headless(_) => (),
         }
     }
 
@@ -111,6 +142,7 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.toggle_debug_tint(),
             Backend::Winit(winit) => winit.toggle_debug_tint(),
+            Backend::Headless(_) => (),
         }
     }
 
@@ -118,6 +150,7 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.import_dmabuf(dmabuf),
             Backend::Winit(winit) => winit.import_dmabuf(dmabuf),
+            Backend::Headless(headless) => headless.import_dmabuf(dmabuf),
         }
     }
 
@@ -125,6 +158,7 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.early_import(surface),
             Backend::Winit(_) => (),
+            Backend::Headless(_) => (),
         }
     }
 
@@ -132,17 +166,18 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.ipc_outputs(),
             Backend::Winit(winit) => winit.ipc_outputs(),
+            Backend::Headless(headless) => headless.ipc_outputs(),
         }
     }
 
     #[cfg(feature = "xdp-gnome-screencast")]
     pub fn gbm_device(
         &self,
-    ) -> Option<smithay::backend::allocator::gbm::GbmDevice<smithay::backend::drm::DrmDeviceFd>>
-    {
+    ) -> Option<smithay::backend::allocator::gbm::GbmDevice<smithay::utils::DeviceFd>> {
         match self {
             Backend::Tty(tty) => tty.primary_gbm_device(),
-            Backend::Winit(_) => None,
+            Backend::Winit(winit) => winit.gbm_device(),
+            Backend::Headless(_) => None,
         }
     }
 
@@ -150,6 +185,23 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.set_monitors_active(active),
             Backend::Winit(_) => (),
+            Backend::Headless(_) => (),
+        }
+    }
+
+    pub fn set_output_on_demand_vrr(&mut self, niri: &mut Niri, output: &Output, enable_vrr: bool) {
+        match self {
+            Backend::Tty(tty) => tty.set_output_on_demand_vrr(niri, output, enable_vrr),
+            Backend::Winit(_) => (),
+            Backend::Headless(_) => (),
+        }
+    }
+
+    pub fn update_ignored_nodes_config(&mut self, niri: &mut Niri) {
+        match self {
+            Backend::Tty(tty) => tty.update_ignored_nodes_config(niri),
+            Backend::Winit(_) => (),
+            Backend::Headless(_) => (),
         }
     }
 
@@ -157,13 +209,15 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.on_output_config_changed(niri),
             Backend::Winit(_) => (),
+            Backend::Headless(_) => (),
         }
     }
 
-    pub fn on_debug_config_changed(&mut self) {
-        match self {
-            Backend::Tty(tty) => tty.on_debug_config_changed(),
-            Backend::Winit(_) => (),
+    pub fn tty_checked(&mut self) -> Option<&mut Tty> {
+        if let Self::Tty(v) = self {
+            Some(v)
+        } else {
+            None
         }
     }
 
@@ -180,6 +234,14 @@ impl Backend {
             v
         } else {
             panic!("backend is not Winit")
+        }
+    }
+
+    pub fn headless(&mut self) -> &mut Headless {
+        if let Self::Headless(v) = self {
+            v
+        } else {
+            panic!("backend is not Headless")
         }
     }
 }

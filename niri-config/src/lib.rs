@@ -1,2645 +1,687 @@
+//! niri config parsing.
+//!
+//! The config can be constructed from multiple files (includes). To support this, many types are
+//! split into two. For example, `Layout` and `LayoutPart` where `Layout` is the final config and
+//! `LayoutPart` is one part parsed from one config file.
+//!
+//! The convention for `Default` impls is to set the initial values before the parsing occurs.
+//! Then, parsing will update the values with those parsed from the config.
+//!
+//! The `Default` values match those from `default-config.kdl` in almost all cases, with a notable
+//! exception of `binds {}` and some window rules.
+
 #[macro_use]
 extern crate tracing;
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ffi::OsStr;
+use std::fs::{self, File};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::time::Duration;
+use std::rc::Rc;
 
-use bitflags::bitflags;
 use knuffel::errors::DecodeError;
 use knuffel::Decode as _;
-use miette::{miette, Context, IntoDiagnostic, NarratableReportHandler};
-use niri_ipc::{ConfiguredMode, LayoutSwitchTarget, SizeChange, Transform, WorkspaceReferenceArg};
-use regex::Regex;
-use smithay::input::keyboard::keysyms::KEY_NoSymbol;
-use smithay::input::keyboard::xkb::{keysym_from_name, KEYSYM_CASE_INSENSITIVE};
-use smithay::input::keyboard::{Keysym, XkbConfig};
-use smithay::reexports::input;
-
-pub const DEFAULT_BACKGROUND_COLOR: Color = Color::from_array_unpremul([0.2, 0.2, 0.2, 1.]);
-
-#[derive(knuffel::Decode, Debug, PartialEq)]
-pub struct Config {
-    #[knuffel(child, default)]
-    pub input: Input,
-    #[knuffel(children(name = "output"))]
-    pub outputs: Outputs,
-    #[knuffel(children(name = "spawn-at-startup"))]
-    pub spawn_at_startup: Vec<SpawnAtStartup>,
-    #[knuffel(child, default)]
-    pub layout: Layout,
-    #[knuffel(child, default)]
-    pub prefer_no_csd: bool,
-    #[knuffel(child, default)]
-    pub cursor: Cursor,
-    #[knuffel(
-        child,
-        unwrap(argument),
-        default = Some(String::from(
-            "~/Pictures/Screenshots/Screenshot from %Y-%m-%d %H-%M-%S.png"
-        )))
-    ]
-    pub screenshot_path: Option<String>,
-    #[knuffel(child, default)]
-    pub hotkey_overlay: HotkeyOverlay,
-    #[knuffel(child, default)]
-    pub animations: Animations,
-    #[knuffel(child, default)]
-    pub environment: Environment,
-    #[knuffel(children(name = "window-rule"))]
-    pub window_rules: Vec<WindowRule>,
-    #[knuffel(child, default)]
-    pub binds: Binds,
-    #[knuffel(child, default)]
-    pub debug: DebugConfig,
-    #[knuffel(children(name = "workspace"))]
-    pub workspaces: Vec<Workspace>,
-}
-
-#[derive(knuffel::Decode, Debug, Default, PartialEq)]
-pub struct Input {
-    #[knuffel(child, default)]
-    pub keyboard: Keyboard,
-    #[knuffel(child, default)]
-    pub touchpad: Touchpad,
-    #[knuffel(child, default)]
-    pub mouse: Mouse,
-    #[knuffel(child, default)]
-    pub trackpoint: Trackpoint,
-    #[knuffel(child, default)]
-    pub tablet: Tablet,
-    #[knuffel(child, default)]
-    pub touch: Touch,
-    #[knuffel(child)]
-    pub disable_power_key_handling: bool,
-    #[knuffel(child)]
-    pub warp_mouse_to_focus: bool,
-    #[knuffel(child)]
-    pub focus_follows_mouse: Option<FocusFollowsMouse>,
-    #[knuffel(child)]
-    pub workspace_auto_back_and_forth: bool,
-}
-
-#[derive(knuffel::Decode, Debug, PartialEq, Eq)]
-pub struct Keyboard {
-    #[knuffel(child, default)]
-    pub xkb: Xkb,
-    // The defaults were chosen to match wlroots and sway.
-    #[knuffel(child, unwrap(argument), default = Self::default().repeat_delay)]
-    pub repeat_delay: u16,
-    #[knuffel(child, unwrap(argument), default = Self::default().repeat_rate)]
-    pub repeat_rate: u8,
-    #[knuffel(child, unwrap(argument), default)]
-    pub track_layout: TrackLayout,
-}
-
-impl Default for Keyboard {
-    fn default() -> Self {
-        Self {
-            xkb: Default::default(),
-            repeat_delay: 600,
-            repeat_rate: 25,
-            track_layout: Default::default(),
-        }
-    }
-}
-
-#[derive(knuffel::Decode, Debug, Default, PartialEq, Eq, Clone)]
-pub struct Xkb {
-    #[knuffel(child, unwrap(argument), default)]
-    pub rules: String,
-    #[knuffel(child, unwrap(argument), default)]
-    pub model: String,
-    #[knuffel(child, unwrap(argument), default)]
-    pub layout: String,
-    #[knuffel(child, unwrap(argument), default)]
-    pub variant: String,
-    #[knuffel(child, unwrap(argument))]
-    pub options: Option<String>,
-}
-
-impl Xkb {
-    pub fn to_xkb_config(&self) -> XkbConfig {
-        XkbConfig {
-            rules: &self.rules,
-            model: &self.model,
-            layout: &self.layout,
-            variant: &self.variant,
-            options: self.options.clone(),
-        }
-    }
-}
-
-#[derive(knuffel::DecodeScalar, Debug, Default, PartialEq, Eq, Clone, Copy)]
-pub enum CenterFocusedColumn {
-    /// Focusing a column will not center the column.
-    #[default]
-    Never,
-    /// The focused column will always be centered.
-    Always,
-    /// Focusing a column will center it if it doesn't fit on the screen together with the
-    /// previously focused column.
-    OnOverflow,
-}
-
-#[derive(knuffel::DecodeScalar, Debug, Default, PartialEq, Eq)]
-pub enum TrackLayout {
-    /// The layout change is global.
-    #[default]
-    Global,
-    /// The layout change is window local.
-    Window,
-}
-
-#[derive(knuffel::Decode, Debug, Default, PartialEq)]
-pub struct Touchpad {
-    #[knuffel(child)]
-    pub off: bool,
-    #[knuffel(child)]
-    pub tap: bool,
-    #[knuffel(child)]
-    pub dwt: bool,
-    #[knuffel(child)]
-    pub dwtp: bool,
-    #[knuffel(child)]
-    pub natural_scroll: bool,
-    #[knuffel(child, unwrap(argument, str))]
-    pub click_method: Option<ClickMethod>,
-    #[knuffel(child, unwrap(argument), default)]
-    pub accel_speed: f64,
-    #[knuffel(child, unwrap(argument, str))]
-    pub accel_profile: Option<AccelProfile>,
-    #[knuffel(child, unwrap(argument, str))]
-    pub scroll_method: Option<ScrollMethod>,
-    #[knuffel(child, unwrap(argument, str))]
-    pub tap_button_map: Option<TapButtonMap>,
-    #[knuffel(child)]
-    pub left_handed: bool,
-    #[knuffel(child)]
-    pub disabled_on_external_mouse: bool,
-    #[knuffel(child)]
-    pub middle_emulation: bool,
-}
-
-#[derive(knuffel::Decode, Debug, Default, PartialEq)]
-pub struct Mouse {
-    #[knuffel(child)]
-    pub off: bool,
-    #[knuffel(child)]
-    pub natural_scroll: bool,
-    #[knuffel(child, unwrap(argument), default)]
-    pub accel_speed: f64,
-    #[knuffel(child, unwrap(argument, str))]
-    pub accel_profile: Option<AccelProfile>,
-    #[knuffel(child, unwrap(argument, str))]
-    pub scroll_method: Option<ScrollMethod>,
-    #[knuffel(child)]
-    pub left_handed: bool,
-    #[knuffel(child)]
-    pub middle_emulation: bool,
-}
-
-#[derive(knuffel::Decode, Debug, Default, PartialEq)]
-pub struct Trackpoint {
-    #[knuffel(child)]
-    pub off: bool,
-    #[knuffel(child)]
-    pub natural_scroll: bool,
-    #[knuffel(child, unwrap(argument), default)]
-    pub accel_speed: f64,
-    #[knuffel(child, unwrap(argument, str))]
-    pub accel_profile: Option<AccelProfile>,
-    #[knuffel(child, unwrap(argument, str))]
-    pub scroll_method: Option<ScrollMethod>,
-    #[knuffel(child)]
-    pub middle_emulation: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClickMethod {
-    Clickfinger,
-    ButtonAreas,
-}
-
-impl From<ClickMethod> for input::ClickMethod {
-    fn from(value: ClickMethod) -> Self {
-        match value {
-            ClickMethod::Clickfinger => Self::Clickfinger,
-            ClickMethod::ButtonAreas => Self::ButtonAreas,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccelProfile {
-    Adaptive,
-    Flat,
-}
-
-impl From<AccelProfile> for input::AccelProfile {
-    fn from(value: AccelProfile) -> Self {
-        match value {
-            AccelProfile::Adaptive => Self::Adaptive,
-            AccelProfile::Flat => Self::Flat,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScrollMethod {
-    NoScroll,
-    TwoFinger,
-    Edge,
-    OnButtonDown,
-}
-
-impl From<ScrollMethod> for input::ScrollMethod {
-    fn from(value: ScrollMethod) -> Self {
-        match value {
-            ScrollMethod::NoScroll => Self::NoScroll,
-            ScrollMethod::TwoFinger => Self::TwoFinger,
-            ScrollMethod::Edge => Self::Edge,
-            ScrollMethod::OnButtonDown => Self::OnButtonDown,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TapButtonMap {
-    LeftRightMiddle,
-    LeftMiddleRight,
-}
-
-impl From<TapButtonMap> for input::TapButtonMap {
-    fn from(value: TapButtonMap) -> Self {
-        match value {
-            TapButtonMap::LeftRightMiddle => Self::LeftRightMiddle,
-            TapButtonMap::LeftMiddleRight => Self::LeftMiddleRight,
-        }
-    }
-}
-
-#[derive(knuffel::Decode, Debug, Default, PartialEq)]
-pub struct Tablet {
-    #[knuffel(child)]
-    pub off: bool,
-    #[knuffel(child, unwrap(argument))]
-    pub map_to_output: Option<String>,
-    #[knuffel(child)]
-    pub left_handed: bool,
-}
-
-#[derive(knuffel::Decode, Debug, Default, PartialEq)]
-pub struct Touch {
-    #[knuffel(child, unwrap(argument))]
-    pub map_to_output: Option<String>,
-}
-
-#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
-pub struct FocusFollowsMouse {
-    #[knuffel(property, str)]
-    pub max_scroll_amount: Option<Percent>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Percent(pub f64);
-
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct Outputs(pub Vec<Output>);
-
-#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
-pub struct Output {
-    #[knuffel(child)]
-    pub off: bool,
-    #[knuffel(argument)]
-    pub name: String,
-    #[knuffel(child, unwrap(argument))]
-    pub scale: Option<FloatOrInt<0, 10>>,
-    #[knuffel(child, unwrap(argument, str), default = Transform::Normal)]
-    pub transform: Transform,
-    #[knuffel(child)]
-    pub position: Option<Position>,
-    #[knuffel(child, unwrap(argument, str))]
-    pub mode: Option<ConfiguredMode>,
-    #[knuffel(child)]
-    pub variable_refresh_rate: bool,
-    #[knuffel(child, default = DEFAULT_BACKGROUND_COLOR)]
-    pub background_color: Color,
-}
-
-impl Default for Output {
-    fn default() -> Self {
-        Self {
-            off: false,
-            name: String::new(),
-            scale: None,
-            transform: Transform::Normal,
-            position: None,
-            mode: None,
-            variable_refresh_rate: false,
-            background_color: DEFAULT_BACKGROUND_COLOR,
-        }
-    }
-}
-
-#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Position {
-    #[knuffel(property)]
-    pub x: i32,
-    #[knuffel(property)]
-    pub y: i32,
-}
-
-// MIN and MAX generics are only used during parsing to check the value.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-pub struct FloatOrInt<const MIN: i32, const MAX: i32>(pub f64);
-
-#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
-pub struct Layout {
-    #[knuffel(child, default)]
-    pub focus_ring: FocusRing,
-    #[knuffel(child, default)]
-    pub border: Border,
-    #[knuffel(child, unwrap(children), default)]
-    pub preset_column_widths: Vec<PresetWidth>,
-    #[knuffel(child)]
-    pub default_column_width: Option<DefaultColumnWidth>,
-    #[knuffel(child, unwrap(argument), default)]
-    pub center_focused_column: CenterFocusedColumn,
-    #[knuffel(child, unwrap(argument), default = Self::default().gaps)]
-    pub gaps: FloatOrInt<0, 65535>,
-    #[knuffel(child, default)]
-    pub struts: Struts,
-}
-
-impl Default for Layout {
-    fn default() -> Self {
-        Self {
-            focus_ring: Default::default(),
-            border: Default::default(),
-            preset_column_widths: Default::default(),
-            default_column_width: Default::default(),
-            center_focused_column: Default::default(),
-            gaps: FloatOrInt(16.),
-            struts: Default::default(),
-        }
-    }
-}
-
-#[derive(knuffel::Decode, Debug, Clone, PartialEq, Eq)]
-pub struct SpawnAtStartup {
-    #[knuffel(arguments)]
-    pub command: Vec<String>,
-}
-
-#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
-pub struct FocusRing {
-    #[knuffel(child)]
-    pub off: bool,
-    #[knuffel(child, unwrap(argument), default = Self::default().width)]
-    pub width: FloatOrInt<0, 65535>,
-    #[knuffel(child, default = Self::default().active_color)]
-    pub active_color: Color,
-    #[knuffel(child, default = Self::default().inactive_color)]
-    pub inactive_color: Color,
-    #[knuffel(child)]
-    pub active_gradient: Option<Gradient>,
-    #[knuffel(child)]
-    pub inactive_gradient: Option<Gradient>,
-}
-
-impl Default for FocusRing {
-    fn default() -> Self {
-        Self {
-            off: false,
-            width: FloatOrInt(4.),
-            active_color: Color::from_rgba8_unpremul(127, 200, 255, 255),
-            inactive_color: Color::from_rgba8_unpremul(80, 80, 80, 255),
-            active_gradient: None,
-            inactive_gradient: None,
-        }
-    }
-}
-
-#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
-pub struct Gradient {
-    #[knuffel(property, str)]
-    pub from: Color,
-    #[knuffel(property, str)]
-    pub to: Color,
-    #[knuffel(property, default = 180)]
-    pub angle: i16,
-    #[knuffel(property, default)]
-    pub relative_to: GradientRelativeTo,
-    #[knuffel(property(name = "in"), str, default)]
-    pub in_: GradientInterpolation,
-}
-
-#[derive(knuffel::DecodeScalar, Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum GradientRelativeTo {
-    #[default]
-    Window,
-    WorkspaceView,
-}
-
-#[derive(Default, Debug, Clone, Copy, PartialEq)]
-pub struct GradientInterpolation {
-    pub color_space: GradientColorSpace,
-    pub hue_interpolation: HueInterpolation,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum GradientColorSpace {
-    #[default]
-    Srgb,
-    SrgbLinear,
-    Oklab,
-    Oklch,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum HueInterpolation {
-    #[default]
-    Shorter,
-    Longer,
-    Increasing,
-    Decreasing,
-}
-
-#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
-pub struct Border {
-    #[knuffel(child)]
-    pub off: bool,
-    #[knuffel(child, unwrap(argument), default = Self::default().width)]
-    pub width: FloatOrInt<0, 65535>,
-    #[knuffel(child, default = Self::default().active_color)]
-    pub active_color: Color,
-    #[knuffel(child, default = Self::default().inactive_color)]
-    pub inactive_color: Color,
-    #[knuffel(child)]
-    pub active_gradient: Option<Gradient>,
-    #[knuffel(child)]
-    pub inactive_gradient: Option<Gradient>,
-}
-
-impl Default for Border {
-    fn default() -> Self {
-        Self {
-            off: true,
-            width: FloatOrInt(4.),
-            active_color: Color::from_rgba8_unpremul(255, 200, 127, 255),
-            inactive_color: Color::from_rgba8_unpremul(80, 80, 80, 255),
-            active_gradient: None,
-            inactive_gradient: None,
-        }
-    }
-}
-
-impl From<Border> for FocusRing {
-    fn from(value: Border) -> Self {
-        Self {
-            off: value.off,
-            width: value.width,
-            active_color: value.active_color,
-            inactive_color: value.inactive_color,
-            active_gradient: value.active_gradient,
-            inactive_gradient: value.inactive_gradient,
-        }
-    }
-}
-
-impl From<FocusRing> for Border {
-    fn from(value: FocusRing) -> Self {
-        Self {
-            off: value.off,
-            width: value.width,
-            active_color: value.active_color,
-            inactive_color: value.inactive_color,
-            active_gradient: value.active_gradient,
-            inactive_gradient: value.inactive_gradient,
-        }
-    }
-}
-
-/// RGB color in [0, 1] with unpremultiplied alpha.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-pub struct Color {
-    pub r: f32,
-    pub g: f32,
-    pub b: f32,
-    pub a: f32,
-}
-
-impl Color {
-    pub const fn new_unpremul(r: f32, g: f32, b: f32, a: f32) -> Self {
-        Self { r, g, b, a }
-    }
-
-    pub fn from_rgba8_unpremul(r: u8, g: u8, b: u8, a: u8) -> Self {
-        Self::from_array_unpremul([r, g, b, a].map(|x| x as f32 / 255.))
-    }
-
-    pub fn from_array_premul([r, g, b, a]: [f32; 4]) -> Self {
-        let a = a.clamp(0., 1.);
-
-        if a == 0. {
-            Self::new_unpremul(0., 0., 0., 0.)
-        } else {
-            Self {
-                r: (r / a).clamp(0., 1.),
-                g: (g / a).clamp(0., 1.),
-                b: (b / a).clamp(0., 1.),
-                a,
-            }
-        }
-    }
-
-    pub const fn from_array_unpremul([r, g, b, a]: [f32; 4]) -> Self {
-        Self { r, g, b, a }
-    }
-
-    pub fn to_array_unpremul(self) -> [f32; 4] {
-        [self.r, self.g, self.b, self.a]
-    }
-
-    pub fn to_array_premul(self) -> [f32; 4] {
-        let [r, g, b, a] = [self.r, self.g, self.b, self.a];
-        [r * a, g * a, b * a, a]
-    }
-}
-
-#[derive(knuffel::Decode, Debug, PartialEq)]
-pub struct Cursor {
-    #[knuffel(child, unwrap(argument), default = String::from("default"))]
-    pub xcursor_theme: String,
-    #[knuffel(child, unwrap(argument), default = 24)]
-    pub xcursor_size: u8,
-}
-
-impl Default for Cursor {
-    fn default() -> Self {
-        Self {
-            xcursor_theme: String::from("default"),
-            xcursor_size: 24,
-        }
-    }
-}
-
-#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
-pub enum PresetWidth {
-    Proportion(#[knuffel(argument)] f64),
-    Fixed(#[knuffel(argument)] i32),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct DefaultColumnWidth(pub Option<PresetWidth>);
-
-#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
-pub struct Struts {
-    #[knuffel(child, unwrap(argument), default)]
-    pub left: FloatOrInt<-65535, 65535>,
-    #[knuffel(child, unwrap(argument), default)]
-    pub right: FloatOrInt<-65535, 65535>,
-    #[knuffel(child, unwrap(argument), default)]
-    pub top: FloatOrInt<-65535, 65535>,
-    #[knuffel(child, unwrap(argument), default)]
-    pub bottom: FloatOrInt<-65535, 65535>,
-}
-
-#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct HotkeyOverlay {
-    #[knuffel(child)]
-    pub skip_at_startup: bool,
-}
-
-#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
-pub struct Animations {
-    #[knuffel(child)]
-    pub off: bool,
-    #[knuffel(child, unwrap(argument), default = 1.)]
-    pub slowdown: f64,
-    #[knuffel(child, default)]
-    pub workspace_switch: WorkspaceSwitchAnim,
-    #[knuffel(child, default)]
-    pub window_open: WindowOpenAnim,
-    #[knuffel(child, default)]
-    pub window_close: WindowCloseAnim,
-    #[knuffel(child, default)]
-    pub horizontal_view_movement: HorizontalViewMovementAnim,
-    #[knuffel(child, default)]
-    pub window_movement: WindowMovementAnim,
-    #[knuffel(child, default)]
-    pub window_resize: WindowResizeAnim,
-    #[knuffel(child, default)]
-    pub config_notification_open_close: ConfigNotificationOpenCloseAnim,
-    #[knuffel(child, default)]
-    pub screenshot_ui_open: ScreenshotUiOpenAnim,
-}
-
-impl Default for Animations {
-    fn default() -> Self {
-        Self {
-            off: false,
-            slowdown: 1.,
-            workspace_switch: Default::default(),
-            horizontal_view_movement: Default::default(),
-            window_movement: Default::default(),
-            window_open: Default::default(),
-            window_close: Default::default(),
-            window_resize: Default::default(),
-            config_notification_open_close: Default::default(),
-            screenshot_ui_open: Default::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct WorkspaceSwitchAnim(pub Animation);
-
-impl Default for WorkspaceSwitchAnim {
-    fn default() -> Self {
-        Self(Animation {
-            off: false,
-            kind: AnimationKind::Spring(SpringParams {
-                damping_ratio: 1.,
-                stiffness: 1000,
-                epsilon: 0.0001,
-            }),
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct WindowOpenAnim {
-    pub anim: Animation,
-    pub custom_shader: Option<String>,
-}
-
-impl Default for WindowOpenAnim {
-    fn default() -> Self {
-        Self {
-            anim: Animation {
-                off: false,
-                kind: AnimationKind::Easing(EasingParams {
-                    duration_ms: 150,
-                    curve: AnimationCurve::EaseOutExpo,
-                }),
-            },
-            custom_shader: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct WindowCloseAnim {
-    pub anim: Animation,
-    pub custom_shader: Option<String>,
-}
-
-impl Default for WindowCloseAnim {
-    fn default() -> Self {
-        Self {
-            anim: Animation {
-                off: false,
-                kind: AnimationKind::Easing(EasingParams {
-                    duration_ms: 150,
-                    curve: AnimationCurve::EaseOutQuad,
-                }),
-            },
-            custom_shader: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct HorizontalViewMovementAnim(pub Animation);
-
-impl Default for HorizontalViewMovementAnim {
-    fn default() -> Self {
-        Self(Animation {
-            off: false,
-            kind: AnimationKind::Spring(SpringParams {
-                damping_ratio: 1.,
-                stiffness: 800,
-                epsilon: 0.0001,
-            }),
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct WindowMovementAnim(pub Animation);
-
-impl Default for WindowMovementAnim {
-    fn default() -> Self {
-        Self(Animation {
-            off: false,
-            kind: AnimationKind::Spring(SpringParams {
-                damping_ratio: 1.,
-                stiffness: 800,
-                epsilon: 0.0001,
-            }),
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct WindowResizeAnim {
-    pub anim: Animation,
-    pub custom_shader: Option<String>,
-}
-
-impl Default for WindowResizeAnim {
-    fn default() -> Self {
-        Self {
-            anim: Animation {
-                off: false,
-                kind: AnimationKind::Spring(SpringParams {
-                    damping_ratio: 1.,
-                    stiffness: 800,
-                    epsilon: 0.0001,
-                }),
-            },
-            custom_shader: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ConfigNotificationOpenCloseAnim(pub Animation);
-
-impl Default for ConfigNotificationOpenCloseAnim {
-    fn default() -> Self {
-        Self(Animation {
-            off: false,
-            kind: AnimationKind::Spring(SpringParams {
-                damping_ratio: 0.6,
-                stiffness: 1000,
-                epsilon: 0.001,
-            }),
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ScreenshotUiOpenAnim(pub Animation);
-
-impl Default for ScreenshotUiOpenAnim {
-    fn default() -> Self {
-        Self(Animation {
-            off: false,
-            kind: AnimationKind::Easing(EasingParams {
-                duration_ms: 200,
-                curve: AnimationCurve::EaseOutQuad,
-            }),
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Animation {
-    pub off: bool,
-    pub kind: AnimationKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AnimationKind {
-    Easing(EasingParams),
-    Spring(SpringParams),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct EasingParams {
-    pub duration_ms: u32,
-    pub curve: AnimationCurve,
-}
-
-#[derive(knuffel::DecodeScalar, Debug, Clone, Copy, PartialEq)]
-pub enum AnimationCurve {
-    Linear,
-    EaseOutQuad,
-    EaseOutCubic,
-    EaseOutExpo,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SpringParams {
-    pub damping_ratio: f64,
-    pub stiffness: u32,
-    pub epsilon: f64,
-}
-
-#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq, Eq)]
-pub struct Environment(#[knuffel(children)] pub Vec<EnvironmentVariable>);
-
-#[derive(knuffel::Decode, Debug, Clone, PartialEq, Eq)]
-pub struct EnvironmentVariable {
-    #[knuffel(node_name)]
-    pub name: String,
-    #[knuffel(argument)]
-    pub value: Option<String>,
-}
-
-#[derive(knuffel::Decode, Debug, Clone, PartialEq, Eq)]
-pub struct Workspace {
-    #[knuffel(argument)]
-    pub name: WorkspaceName,
-    #[knuffel(child, unwrap(argument))]
-    pub open_on_output: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceName(pub String);
-
-#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
-pub struct WindowRule {
-    #[knuffel(children(name = "match"))]
-    pub matches: Vec<Match>,
-    #[knuffel(children(name = "exclude"))]
-    pub excludes: Vec<Match>,
-
-    // Rules applied at initial configure.
-    #[knuffel(child)]
-    pub default_column_width: Option<DefaultColumnWidth>,
-    #[knuffel(child, unwrap(argument))]
-    pub open_on_output: Option<String>,
-    #[knuffel(child, unwrap(argument))]
-    pub open_on_workspace: Option<String>,
-    #[knuffel(child, unwrap(argument))]
-    pub open_maximized: Option<bool>,
-    #[knuffel(child, unwrap(argument))]
-    pub open_fullscreen: Option<bool>,
-
-    // Rules applied dynamically.
-    #[knuffel(child, unwrap(argument))]
-    pub min_width: Option<u16>,
-    #[knuffel(child, unwrap(argument))]
-    pub min_height: Option<u16>,
-    #[knuffel(child, unwrap(argument))]
-    pub max_width: Option<u16>,
-    #[knuffel(child, unwrap(argument))]
-    pub max_height: Option<u16>,
-
-    #[knuffel(child, default)]
-    pub focus_ring: BorderRule,
-    #[knuffel(child, default)]
-    pub border: BorderRule,
-    #[knuffel(child, unwrap(argument))]
-    pub draw_border_with_background: Option<bool>,
-    #[knuffel(child, unwrap(argument))]
-    pub opacity: Option<f32>,
-    #[knuffel(child)]
-    pub geometry_corner_radius: Option<CornerRadius>,
-    #[knuffel(child, unwrap(argument))]
-    pub clip_to_geometry: Option<bool>,
-    #[knuffel(child, unwrap(argument))]
-    pub block_out_from: Option<BlockOutFrom>,
-}
-
-// Remember to update the PartialEq impl when adding fields!
-#[derive(knuffel::Decode, Debug, Default, Clone)]
-pub struct Match {
-    #[knuffel(property, str)]
-    pub app_id: Option<Regex>,
-    #[knuffel(property, str)]
-    pub title: Option<Regex>,
-    #[knuffel(property)]
-    pub is_active: Option<bool>,
-    #[knuffel(property)]
-    pub is_focused: Option<bool>,
-    #[knuffel(property)]
-    pub is_active_in_column: Option<bool>,
-    #[knuffel(property)]
-    pub at_startup: Option<bool>,
-}
-
-impl PartialEq for Match {
-    fn eq(&self, other: &Self) -> bool {
-        self.is_active == other.is_active
-            && self.is_focused == other.is_focused
-            && self.is_active_in_column == other.is_active_in_column
-            && self.at_startup == other.at_startup
-            && self.app_id.as_ref().map(Regex::as_str) == other.app_id.as_ref().map(Regex::as_str)
-            && self.title.as_ref().map(Regex::as_str) == other.title.as_ref().map(Regex::as_str)
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-pub struct CornerRadius {
-    pub top_left: f32,
-    pub top_right: f32,
-    pub bottom_right: f32,
-    pub bottom_left: f32,
-}
-
-impl From<CornerRadius> for [f32; 4] {
-    fn from(value: CornerRadius) -> Self {
-        [
-            value.top_left,
-            value.top_right,
-            value.bottom_right,
-            value.bottom_left,
-        ]
-    }
-}
-
-#[derive(knuffel::DecodeScalar, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockOutFrom {
-    Screencast,
-    ScreenCapture,
-}
-
-#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
-pub struct BorderRule {
-    #[knuffel(child)]
-    pub off: bool,
-    #[knuffel(child)]
-    pub on: bool,
-    #[knuffel(child, unwrap(argument))]
-    pub width: Option<FloatOrInt<0, 65535>>,
-    #[knuffel(child)]
-    pub active_color: Option<Color>,
-    #[knuffel(child)]
-    pub inactive_color: Option<Color>,
-    #[knuffel(child)]
-    pub active_gradient: Option<Gradient>,
-    #[knuffel(child)]
-    pub inactive_gradient: Option<Gradient>,
-}
+use miette::{miette, Context as _, IntoDiagnostic as _};
+
+#[macro_use]
+pub mod macros;
+
+pub mod animations;
+pub mod appearance;
+pub mod binds;
+pub mod debug;
+pub mod error;
+pub mod gestures;
+pub mod input;
+pub mod layer_rule;
+pub mod layout;
+pub mod misc;
+pub mod output;
+pub mod recent_windows;
+pub mod utils;
+pub mod window_rule;
+pub mod workspace;
+
+pub use crate::animations::{Animation, Animations};
+pub use crate::appearance::*;
+pub use crate::binds::*;
+pub use crate::debug::Debug;
+pub use crate::error::{ConfigIncludeError, ConfigParseResult};
+pub use crate::gestures::Gestures;
+pub use crate::input::{Input, ModKey, ScrollMethod, TrackLayout, WarpMouseToFocusMode, Xkb};
+pub use crate::layer_rule::LayerRule;
+pub use crate::layout::*;
+pub use crate::misc::*;
+pub use crate::output::{Output, OutputName, Outputs, Position, Vrr};
+use crate::recent_windows::RecentWindowsPart;
+pub use crate::recent_windows::{MruDirection, MruFilter, MruPreviews, MruScope, RecentWindows};
+pub use crate::utils::FloatOrInt;
+use crate::utils::{Flag, MergeWith as _};
+pub use crate::window_rule::{
+    FloatingPosition, OnXdgActivate, PopupsRule, RelativeTo, ResolvedPopupsRules, WindowRule,
+};
+pub use crate::workspace::{Workspace, WorkspaceLayoutPart};
+
+const RECURSION_LIMIT: u8 = 10;
 
 #[derive(Debug, Default, PartialEq)]
-pub struct Binds(pub Vec<Bind>);
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Bind {
-    pub key: Key,
-    pub action: Action,
-    pub repeat: bool,
-    pub cooldown: Option<Duration>,
-    pub allow_when_locked: bool,
+pub struct Config {
+    pub input: Input,
+    pub outputs: Outputs,
+    pub spawn_at_startup: Vec<SpawnAtStartup>,
+    pub spawn_sh_at_startup: Vec<SpawnShAtStartup>,
+    pub layout: Layout,
+    pub prefer_no_csd: bool,
+    pub cursor: Cursor,
+    pub screenshot_path: ScreenshotPath,
+    pub clipboard: Clipboard,
+    pub hotkey_overlay: HotkeyOverlay,
+    pub config_notification: ConfigNotification,
+    pub animations: Animations,
+    pub blur: Blur,
+    pub gestures: Gestures,
+    pub overview: Overview,
+    pub environment: Environment,
+    pub xwayland_satellite: XwaylandSatellite,
+    pub window_rules: Vec<WindowRule>,
+    pub layer_rules: Vec<LayerRule>,
+    pub binds: Binds,
+    pub switch_events: SwitchBinds,
+    pub debug: Debug,
+    pub workspaces: Vec<Workspace>,
+    pub recent_windows: RecentWindows,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
-pub struct Key {
-    pub trigger: Trigger,
-    pub modifiers: Modifiers,
+#[derive(Debug, Clone)]
+pub enum ConfigPath {
+    /// Explicitly set config path.
+    ///
+    /// Load the config only from this path, never create it.
+    Explicit(PathBuf),
+
+    /// Default config path.
+    ///
+    /// Prioritize the user path, fallback to the system path, fallback to creating the user path
+    /// at compositor startup.
+    Regular {
+        /// User config path, usually `$XDG_CONFIG_HOME/niri/config.kdl`.
+        user_path: PathBuf,
+        /// System config path, usually `/etc/niri/config.kdl`.
+        system_path: PathBuf,
+    },
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
-pub enum Trigger {
-    Keysym(Keysym),
-    WheelScrollDown,
-    WheelScrollUp,
-    WheelScrollLeft,
-    WheelScrollRight,
-    TouchpadScrollDown,
-    TouchpadScrollUp,
-    TouchpadScrollLeft,
-    TouchpadScrollRight,
-}
+// Newtypes for putting information into the knuffel context.
+struct BasePath(PathBuf);
+struct RootBase(PathBuf);
+struct Recursion(u8);
+#[derive(Default)]
+struct Includes(Vec<PathBuf>);
+#[derive(Default)]
+struct IncludeErrors(Vec<knuffel::Error>);
+// Used for recursive include detection.
+//
+// We don't *need* it because we have a recursion limit, but it makes for nicer error messages.
+struct IncludeStack(HashSet<PathBuf>);
+struct SawMruBinds(Rc<Cell<bool>>);
 
-bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct Modifiers : u8 {
-        const CTRL = 1;
-        const SHIFT = 2;
-        const ALT = 4;
-        const SUPER = 8;
-        const ISO_LEVEL3_SHIFT = 16;
-        const COMPOSITOR = 32;
-    }
-}
+// Rather than listing all fields and deriving knuffel::Decode, we implement
+// knuffel::DecodeChildren by hand, since we need custom logic for every field anyway: we want to
+// merge the values into the config from the context as we go to support the positionality of
+// includes. The reason we need this type at all is because knuffel's only entry point that allows
+// setting default values on a context is `parse_with_context()` that needs a type to parse.
+pub struct ConfigPart;
 
-// Remember to add new actions to the CLI enum too.
-#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
-pub enum Action {
-    Quit(#[knuffel(property(name = "skip-confirmation"), default)] bool),
-    #[knuffel(skip)]
-    ChangeVt(i32),
-    Suspend,
-    PowerOffMonitors,
-    ToggleDebugTint,
-    DebugToggleOpaqueRegions,
-    DebugToggleDamage,
-    Spawn(#[knuffel(arguments)] Vec<String>),
-    DoScreenTransition(#[knuffel(property(name = "delay-ms"))] Option<u16>),
-    #[knuffel(skip)]
-    ConfirmScreenshot,
-    #[knuffel(skip)]
-    CancelScreenshot,
-    #[knuffel(skip)]
-    ScreenshotTogglePointer,
-    Screenshot,
-    ScreenshotScreen,
-    ScreenshotWindow,
-    CloseWindow,
-    FullscreenWindow,
-    FocusColumnLeft,
-    FocusColumnRight,
-    FocusColumnFirst,
-    FocusColumnLast,
-    FocusColumnRightOrFirst,
-    FocusColumnLeftOrLast,
-    FocusWindowOrMonitorUp,
-    FocusWindowOrMonitorDown,
-    FocusColumnOrMonitorLeft,
-    FocusColumnOrMonitorRight,
-    FocusWindowDown,
-    FocusWindowUp,
-    FocusWindowDownOrColumnLeft,
-    FocusWindowDownOrColumnRight,
-    FocusWindowUpOrColumnLeft,
-    FocusWindowUpOrColumnRight,
-    FocusWindowOrWorkspaceDown,
-    FocusWindowOrWorkspaceUp,
-    MoveColumnLeft,
-    MoveColumnRight,
-    MoveColumnToFirst,
-    MoveColumnToLast,
-    MoveColumnLeftOrToMonitorLeft,
-    MoveColumnRightOrToMonitorRight,
-    MoveWindowDown,
-    MoveWindowUp,
-    MoveWindowDownOrToWorkspaceDown,
-    MoveWindowUpOrToWorkspaceUp,
-    ConsumeOrExpelWindowLeft,
-    ConsumeOrExpelWindowRight,
-    ConsumeWindowIntoColumn,
-    ExpelWindowFromColumn,
-    CenterColumn,
-    FocusWorkspaceDown,
-    FocusWorkspaceUp,
-    FocusWorkspace(#[knuffel(argument)] WorkspaceReference),
-    FocusWorkspacePrevious,
-    MoveWindowToWorkspaceDown,
-    MoveWindowToWorkspaceUp,
-    MoveWindowToWorkspace(#[knuffel(argument)] WorkspaceReference),
-    MoveColumnToWorkspaceDown,
-    MoveColumnToWorkspaceUp,
-    MoveColumnToWorkspace(#[knuffel(argument)] WorkspaceReference),
-    MoveWorkspaceDown,
-    MoveWorkspaceUp,
-    FocusMonitorLeft,
-    FocusMonitorRight,
-    FocusMonitorDown,
-    FocusMonitorUp,
-    MoveWindowToMonitorLeft,
-    MoveWindowToMonitorRight,
-    MoveWindowToMonitorDown,
-    MoveWindowToMonitorUp,
-    MoveColumnToMonitorLeft,
-    MoveColumnToMonitorRight,
-    MoveColumnToMonitorDown,
-    MoveColumnToMonitorUp,
-    SetWindowHeight(#[knuffel(argument, str)] SizeChange),
-    ResetWindowHeight,
-    SwitchPresetColumnWidth,
-    MaximizeColumn,
-    SetColumnWidth(#[knuffel(argument, str)] SizeChange),
-    SwitchLayout(#[knuffel(argument, str)] LayoutSwitchTarget),
-    ShowHotkeyOverlay,
-    MoveWorkspaceToMonitorLeft,
-    MoveWorkspaceToMonitorRight,
-    MoveWorkspaceToMonitorDown,
-    MoveWorkspaceToMonitorUp,
-}
-
-impl From<niri_ipc::Action> for Action {
-    fn from(value: niri_ipc::Action) -> Self {
-        match value {
-            niri_ipc::Action::Quit { skip_confirmation } => Self::Quit(skip_confirmation),
-            niri_ipc::Action::PowerOffMonitors => Self::PowerOffMonitors,
-            niri_ipc::Action::Spawn { command } => Self::Spawn(command),
-            niri_ipc::Action::DoScreenTransition { delay_ms } => Self::DoScreenTransition(delay_ms),
-            niri_ipc::Action::Screenshot => Self::Screenshot,
-            niri_ipc::Action::ScreenshotScreen => Self::ScreenshotScreen,
-            niri_ipc::Action::ScreenshotWindow => Self::ScreenshotWindow,
-            niri_ipc::Action::CloseWindow => Self::CloseWindow,
-            niri_ipc::Action::FullscreenWindow => Self::FullscreenWindow,
-            niri_ipc::Action::FocusColumnLeft => Self::FocusColumnLeft,
-            niri_ipc::Action::FocusColumnRight => Self::FocusColumnRight,
-            niri_ipc::Action::FocusColumnFirst => Self::FocusColumnFirst,
-            niri_ipc::Action::FocusColumnLast => Self::FocusColumnLast,
-            niri_ipc::Action::FocusColumnRightOrFirst => Self::FocusColumnRightOrFirst,
-            niri_ipc::Action::FocusColumnLeftOrLast => Self::FocusColumnLeftOrLast,
-            niri_ipc::Action::FocusWindowOrMonitorUp => Self::FocusWindowOrMonitorUp,
-            niri_ipc::Action::FocusWindowOrMonitorDown => Self::FocusWindowOrMonitorDown,
-            niri_ipc::Action::FocusColumnOrMonitorLeft => Self::FocusColumnOrMonitorLeft,
-            niri_ipc::Action::FocusColumnOrMonitorRight => Self::FocusColumnOrMonitorRight,
-            niri_ipc::Action::FocusWindowDown => Self::FocusWindowDown,
-            niri_ipc::Action::FocusWindowUp => Self::FocusWindowUp,
-            niri_ipc::Action::FocusWindowDownOrColumnLeft => Self::FocusWindowDownOrColumnLeft,
-            niri_ipc::Action::FocusWindowDownOrColumnRight => Self::FocusWindowDownOrColumnRight,
-            niri_ipc::Action::FocusWindowUpOrColumnLeft => Self::FocusWindowUpOrColumnLeft,
-            niri_ipc::Action::FocusWindowUpOrColumnRight => Self::FocusWindowUpOrColumnRight,
-            niri_ipc::Action::FocusWindowOrWorkspaceDown => Self::FocusWindowOrWorkspaceDown,
-            niri_ipc::Action::FocusWindowOrWorkspaceUp => Self::FocusWindowOrWorkspaceUp,
-            niri_ipc::Action::MoveColumnLeft => Self::MoveColumnLeft,
-            niri_ipc::Action::MoveColumnRight => Self::MoveColumnRight,
-            niri_ipc::Action::MoveColumnToFirst => Self::MoveColumnToFirst,
-            niri_ipc::Action::MoveColumnToLast => Self::MoveColumnToLast,
-            niri_ipc::Action::MoveColumnLeftOrToMonitorLeft => Self::MoveColumnLeftOrToMonitorLeft,
-            niri_ipc::Action::MoveColumnRightOrToMonitorRight => {
-                Self::MoveColumnRightOrToMonitorRight
-            }
-            niri_ipc::Action::MoveWindowDown => Self::MoveWindowDown,
-            niri_ipc::Action::MoveWindowUp => Self::MoveWindowUp,
-            niri_ipc::Action::MoveWindowDownOrToWorkspaceDown => {
-                Self::MoveWindowDownOrToWorkspaceDown
-            }
-            niri_ipc::Action::MoveWindowUpOrToWorkspaceUp => Self::MoveWindowUpOrToWorkspaceUp,
-            niri_ipc::Action::ConsumeOrExpelWindowLeft => Self::ConsumeOrExpelWindowLeft,
-            niri_ipc::Action::ConsumeOrExpelWindowRight => Self::ConsumeOrExpelWindowRight,
-            niri_ipc::Action::ConsumeWindowIntoColumn => Self::ConsumeWindowIntoColumn,
-            niri_ipc::Action::ExpelWindowFromColumn => Self::ExpelWindowFromColumn,
-            niri_ipc::Action::CenterColumn => Self::CenterColumn,
-            niri_ipc::Action::FocusWorkspaceDown => Self::FocusWorkspaceDown,
-            niri_ipc::Action::FocusWorkspaceUp => Self::FocusWorkspaceUp,
-            niri_ipc::Action::FocusWorkspace { reference } => {
-                Self::FocusWorkspace(WorkspaceReference::from(reference))
-            }
-            niri_ipc::Action::FocusWorkspacePrevious => Self::FocusWorkspacePrevious,
-            niri_ipc::Action::MoveWindowToWorkspaceDown => Self::MoveWindowToWorkspaceDown,
-            niri_ipc::Action::MoveWindowToWorkspaceUp => Self::MoveWindowToWorkspaceUp,
-            niri_ipc::Action::MoveWindowToWorkspace { reference } => {
-                Self::MoveWindowToWorkspace(WorkspaceReference::from(reference))
-            }
-            niri_ipc::Action::MoveColumnToWorkspaceDown => Self::MoveColumnToWorkspaceDown,
-            niri_ipc::Action::MoveColumnToWorkspaceUp => Self::MoveColumnToWorkspaceUp,
-            niri_ipc::Action::MoveColumnToWorkspace { reference } => {
-                Self::MoveColumnToWorkspace(WorkspaceReference::from(reference))
-            }
-            niri_ipc::Action::MoveWorkspaceDown => Self::MoveWorkspaceDown,
-            niri_ipc::Action::MoveWorkspaceUp => Self::MoveWorkspaceUp,
-            niri_ipc::Action::FocusMonitorLeft => Self::FocusMonitorLeft,
-            niri_ipc::Action::FocusMonitorRight => Self::FocusMonitorRight,
-            niri_ipc::Action::FocusMonitorDown => Self::FocusMonitorDown,
-            niri_ipc::Action::FocusMonitorUp => Self::FocusMonitorUp,
-            niri_ipc::Action::MoveWindowToMonitorLeft => Self::MoveWindowToMonitorLeft,
-            niri_ipc::Action::MoveWindowToMonitorRight => Self::MoveWindowToMonitorRight,
-            niri_ipc::Action::MoveWindowToMonitorDown => Self::MoveWindowToMonitorDown,
-            niri_ipc::Action::MoveWindowToMonitorUp => Self::MoveWindowToMonitorUp,
-            niri_ipc::Action::MoveColumnToMonitorLeft => Self::MoveColumnToMonitorLeft,
-            niri_ipc::Action::MoveColumnToMonitorRight => Self::MoveColumnToMonitorRight,
-            niri_ipc::Action::MoveColumnToMonitorDown => Self::MoveColumnToMonitorDown,
-            niri_ipc::Action::MoveColumnToMonitorUp => Self::MoveColumnToMonitorUp,
-            niri_ipc::Action::SetWindowHeight { change } => Self::SetWindowHeight(change),
-            niri_ipc::Action::ResetWindowHeight => Self::ResetWindowHeight,
-            niri_ipc::Action::SwitchPresetColumnWidth => Self::SwitchPresetColumnWidth,
-            niri_ipc::Action::MaximizeColumn => Self::MaximizeColumn,
-            niri_ipc::Action::SetColumnWidth { change } => Self::SetColumnWidth(change),
-            niri_ipc::Action::SwitchLayout { layout } => Self::SwitchLayout(layout),
-            niri_ipc::Action::ShowHotkeyOverlay => Self::ShowHotkeyOverlay,
-            niri_ipc::Action::MoveWorkspaceToMonitorLeft => Self::MoveWorkspaceToMonitorLeft,
-            niri_ipc::Action::MoveWorkspaceToMonitorRight => Self::MoveWorkspaceToMonitorRight,
-            niri_ipc::Action::MoveWorkspaceToMonitorDown => Self::MoveWorkspaceToMonitorDown,
-            niri_ipc::Action::MoveWorkspaceToMonitorUp => Self::MoveWorkspaceToMonitorUp,
-            niri_ipc::Action::ToggleDebugTint => Self::ToggleDebugTint,
-            niri_ipc::Action::DebugToggleOpaqueRegions => Self::DebugToggleOpaqueRegions,
-            niri_ipc::Action::DebugToggleDamage => Self::DebugToggleDamage,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum WorkspaceReference {
-    Index(u8),
-    Name(String),
-}
-
-impl From<WorkspaceReferenceArg> for WorkspaceReference {
-    fn from(reference: WorkspaceReferenceArg) -> WorkspaceReference {
-        match reference {
-            WorkspaceReferenceArg::Index(i) => Self::Index(i),
-            WorkspaceReferenceArg::Name(n) => Self::Name(n),
-        }
-    }
-}
-
-impl<S: knuffel::traits::ErrorSpan> knuffel::DecodeScalar<S> for WorkspaceReference {
-    fn type_check(
-        type_name: &Option<knuffel::span::Spanned<knuffel::ast::TypeName, S>>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) {
-        if let Some(type_name) = &type_name {
-            ctx.emit_error(DecodeError::unexpected(
-                type_name,
-                "type name",
-                "no type name expected for this node",
-            ));
-        }
-    }
-
-    fn raw_decode(
-        val: &knuffel::span::Spanned<knuffel::ast::Literal, S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<WorkspaceReference, DecodeError<S>> {
-        match &**val {
-            knuffel::ast::Literal::String(ref s) => Ok(WorkspaceReference::Name(s.clone().into())),
-            knuffel::ast::Literal::Int(ref value) => match value.try_into() {
-                Ok(v) => Ok(WorkspaceReference::Index(v)),
-                Err(e) => {
-                    ctx.emit_error(DecodeError::conversion(val, e));
-                    Ok(WorkspaceReference::Index(0))
-                }
-            },
-            _ => {
-                ctx.emit_error(DecodeError::unsupported(
-                    val,
-                    "Unsupported value, only numbers and strings are recognized",
-                ));
-                Ok(WorkspaceReference::Index(0))
-            }
-        }
-    }
-}
-
-impl<S: knuffel::traits::ErrorSpan, const MIN: i32, const MAX: i32> knuffel::DecodeScalar<S>
-    for FloatOrInt<MIN, MAX>
-{
-    fn type_check(
-        type_name: &Option<knuffel::span::Spanned<knuffel::ast::TypeName, S>>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) {
-        if let Some(type_name) = &type_name {
-            ctx.emit_error(DecodeError::unexpected(
-                type_name,
-                "type name",
-                "no type name expected for this node",
-            ));
-        }
-    }
-
-    fn raw_decode(
-        val: &knuffel::span::Spanned<knuffel::ast::Literal, S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        match &**val {
-            knuffel::ast::Literal::Int(ref value) => match value.try_into() {
-                Ok(v) => {
-                    if (MIN..=MAX).contains(&v) {
-                        Ok(FloatOrInt(f64::from(v)))
-                    } else {
-                        ctx.emit_error(DecodeError::conversion(
-                            val,
-                            format!("value must be between {MIN} and {MAX}"),
-                        ));
-                        Ok(FloatOrInt::default())
-                    }
-                }
-                Err(e) => {
-                    ctx.emit_error(DecodeError::conversion(val, e));
-                    Ok(FloatOrInt::default())
-                }
-            },
-            knuffel::ast::Literal::Decimal(ref value) => match value.try_into() {
-                Ok(v) => {
-                    if (f64::from(MIN)..=f64::from(MAX)).contains(&v) {
-                        Ok(FloatOrInt(v))
-                    } else {
-                        ctx.emit_error(DecodeError::conversion(
-                            val,
-                            format!("value must be between {MIN} and {MAX}"),
-                        ));
-                        Ok(FloatOrInt::default())
-                    }
-                }
-                Err(e) => {
-                    ctx.emit_error(DecodeError::conversion(val, e));
-                    Ok(FloatOrInt::default())
-                }
-            },
-            _ => {
-                ctx.emit_error(DecodeError::unsupported(
-                    val,
-                    "Unsupported value, only numbers are recognized",
-                ));
-                Ok(FloatOrInt::default())
-            }
-        }
-    }
-}
-
-#[derive(knuffel::Decode, Debug, Default, PartialEq)]
-pub struct DebugConfig {
-    #[knuffel(child, unwrap(argument))]
-    pub preview_render: Option<PreviewRender>,
-    #[knuffel(child)]
-    pub dbus_interfaces_in_non_session_instances: bool,
-    #[knuffel(child)]
-    pub wait_for_frame_completion_before_queueing: bool,
-    #[knuffel(child)]
-    pub enable_overlay_planes: bool,
-    #[knuffel(child)]
-    pub disable_cursor_plane: bool,
-    #[knuffel(child)]
-    pub disable_direct_scanout: bool,
-    #[knuffel(child, unwrap(argument))]
-    pub render_drm_device: Option<PathBuf>,
-    #[knuffel(child)]
-    pub emulate_zero_presentation_time: bool,
-}
-
-#[derive(knuffel::DecodeScalar, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreviewRender {
-    Screencast,
-    ScreenCapture,
-}
-
-impl Config {
-    pub fn load(path: &Path) -> miette::Result<Self> {
-        let _span = tracy_client::span!("Config::load");
-        Self::load_internal(path).context("error loading config")
-    }
-
-    fn load_internal(path: &Path) -> miette::Result<Self> {
-        let contents = std::fs::read_to_string(path)
-            .into_diagnostic()
-            .with_context(|| format!("error reading {path:?}"))?;
-
-        let config = Self::parse(
-            path.file_name()
-                .and_then(OsStr::to_str)
-                .unwrap_or("config.kdl"),
-            &contents,
-        )
-        .context("error parsing")?;
-        debug!("loaded config from {path:?}");
-        Ok(config)
-    }
-
-    pub fn parse(filename: &str, text: &str) -> Result<Self, knuffel::Error> {
-        let _span = tracy_client::span!("Config::parse");
-        knuffel::parse(filename, text)
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config::parse(
-            "default-config.kdl",
-            include_str!("../../resources/default-config.kdl"),
-        )
-        .unwrap()
-    }
-}
-
-impl BorderRule {
-    pub fn merge_with(&mut self, other: &Self) {
-        self.off |= other.off;
-        self.on |= other.on;
-
-        if let Some(x) = other.width {
-            self.width = Some(x);
-        }
-        if let Some(x) = other.active_color {
-            self.active_color = Some(x);
-        }
-        if let Some(x) = other.inactive_color {
-            self.inactive_color = Some(x);
-        }
-        if let Some(x) = other.active_gradient {
-            self.active_gradient = Some(x);
-        }
-        if let Some(x) = other.inactive_gradient {
-            self.inactive_gradient = Some(x);
-        }
-    }
-
-    pub fn resolve_against(&self, mut config: Border) -> Border {
-        config.off |= self.off;
-        if self.on {
-            config.off = false;
-        }
-
-        if let Some(x) = self.width {
-            config.width = x;
-        }
-        if let Some(x) = self.active_color {
-            config.active_color = x;
-            config.active_gradient = None;
-        }
-        if let Some(x) = self.inactive_color {
-            config.inactive_color = x;
-            config.inactive_gradient = None;
-        }
-        if let Some(x) = self.active_gradient {
-            config.active_gradient = Some(x);
-        }
-        if let Some(x) = self.inactive_gradient {
-            config.inactive_gradient = Some(x);
-        }
-
-        config
-    }
-}
-
-impl CornerRadius {
-    pub fn fit_to(self, width: f32, height: f32) -> Self {
-        // Like in CSS: https://drafts.csswg.org/css-backgrounds/#corner-overlap
-        let reduction = f32::min(
-            f32::min(
-                width / (self.top_left + self.top_right),
-                width / (self.bottom_left + self.bottom_right),
-            ),
-            f32::min(
-                height / (self.top_left + self.bottom_left),
-                height / (self.top_right + self.bottom_right),
-            ),
-        );
-        let reduction = f32::min(1., reduction);
-
-        Self {
-            top_left: self.top_left * reduction,
-            top_right: self.top_right * reduction,
-            bottom_right: self.bottom_right * reduction,
-            bottom_left: self.bottom_left * reduction,
-        }
-    }
-
-    pub fn expanded_by(mut self, width: f32) -> Self {
-        if self.top_left > 0. {
-            self.top_left += width;
-        }
-        if self.top_right > 0. {
-            self.top_right += width;
-        }
-        if self.bottom_right > 0. {
-            self.bottom_right += width;
-        }
-        if self.bottom_left > 0. {
-            self.bottom_left += width;
-        }
-
-        self
-    }
-
-    pub fn scaled_by(self, scale: f32) -> Self {
-        Self {
-            top_left: self.top_left * scale,
-            top_right: self.top_right * scale,
-            bottom_right: self.bottom_right * scale,
-            bottom_left: self.bottom_left * scale,
-        }
-    }
-}
-
-impl FromStr for GradientInterpolation {
-    type Err = miette::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut iter = s.split_whitespace();
-        let in_part1 = iter.next();
-        let in_part2 = iter.next();
-        let in_part3 = iter.next();
-
-        let Some(in_part1) = in_part1 else {
-            return Err(miette!("missing color space"));
-        };
-
-        let color = match in_part1 {
-            "srgb" => GradientColorSpace::Srgb,
-            "srgb-linear" => GradientColorSpace::SrgbLinear,
-            "oklab" => GradientColorSpace::Oklab,
-            "oklch" => GradientColorSpace::Oklch,
-            x => {
-                return Err(miette!(
-                    "invalid color space {x}; can be srgb, srgb-linear, oklab or oklch"
-                ))
-            }
-        };
-
-        let interpolation = if let Some(in_part2) = in_part2 {
-            if color != GradientColorSpace::Oklch {
-                return Err(miette!("only oklch color space can have hue interpolation"));
-            }
-
-            if in_part3 != Some("hue") {
-                return Err(miette!(
-                    "interpolation must end with \"hue\", like \"oklch shorter hue\""
-                ));
-            } else if iter.next().is_some() {
-                return Err(miette!("unexpected text after hue interpolation"));
-            } else {
-                match in_part2 {
-                    "shorter" => HueInterpolation::Shorter,
-                    "longer" => HueInterpolation::Longer,
-                    "increasing" => HueInterpolation::Increasing,
-                    "decreasing" => HueInterpolation::Decreasing,
-                    x => {
-                        return Err(miette!(
-                            "invalid hue interpolation {x}; \
-                             can be shorter, longer, increasing, decreasing"
-                        ))
-                    }
-                }
-            }
-        } else {
-            HueInterpolation::default()
-        };
-
-        Ok(Self {
-            color_space: color,
-            hue_interpolation: interpolation,
-        })
-    }
-}
-
-impl FromStr for Color {
-    type Err = miette::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let color = csscolorparser::parse(s).into_diagnostic()?.to_array();
-        Ok(Self::from_array_unpremul(color.map(|x| x as f32)))
-    }
-}
-
-#[derive(knuffel::Decode)]
-struct ColorRgba {
-    #[knuffel(argument)]
-    r: u8,
-    #[knuffel(argument)]
-    g: u8,
-    #[knuffel(argument)]
-    b: u8,
-    #[knuffel(argument)]
-    a: u8,
-}
-
-impl From<ColorRgba> for Color {
-    fn from(value: ColorRgba) -> Self {
-        let ColorRgba { r, g, b, a } = value;
-        Self::from_array_unpremul([r, g, b, a].map(|x| x as f32 / 255.))
-    }
-}
-
-// Manual impl to allow both one-argument string and 4-argument RGBA forms.
-impl<S> knuffel::Decode<S> for Color
+impl<S> knuffel::DecodeChildren<S> for ConfigPart
 where
     S: knuffel::traits::ErrorSpan,
 {
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
+    fn decode_children(
+        nodes: &[knuffel::ast::SpannedNode<S>],
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
-        // Check for unexpected type name.
-        if let Some(type_name) = &node.type_name {
-            ctx.emit_error(DecodeError::unexpected(
-                type_name,
-                "type name",
-                "no type name expected for this node",
-            ));
-        }
+        let _span = tracy_client::span!("decode config file");
 
-        // Get the first argument.
-        let mut iter_args = node.arguments.iter();
-        let val = iter_args
-            .next()
-            .ok_or_else(|| DecodeError::missing(node, "additional argument is required"))?;
+        let config = ctx.get::<Rc<RefCell<Config>>>().unwrap().clone();
+        let includes = ctx.get::<Rc<RefCell<Includes>>>().unwrap().clone();
+        let include_errors = ctx.get::<Rc<RefCell<IncludeErrors>>>().unwrap().clone();
+        let recursion = ctx.get::<Recursion>().unwrap().0;
+        let saw_mru_binds = ctx.get::<SawMruBinds>().unwrap().0.clone();
 
-        // Check for unexpected type name.
-        if let Some(typ) = &val.type_name {
-            ctx.emit_error(DecodeError::TypeName {
-                span: typ.span().clone(),
-                found: Some((**typ).clone()),
-                expected: knuffel::errors::ExpectedType::no_type(),
-                rust_type: "str",
-            });
-        }
+        let mut seen = HashSet::new();
 
-        // Check the argument type.
-        let rv = match *val.literal {
-            // If it's a string, use FromStr.
-            knuffel::ast::Literal::String(ref s) => {
-                Color::from_str(s).map_err(|e| DecodeError::conversion(&val.literal, e))
-            }
-            // Otherwise, fall back to the 4-argument RGBA form.
-            _ => return ColorRgba::decode_node(node, ctx).map(Color::from),
-        }?;
+        for node in nodes {
+            let name = &**node.node_name;
 
-        // Check for unexpected following arguments.
-        if let Some(val) = iter_args.next() {
-            ctx.emit_error(DecodeError::unexpected(
-                &val.literal,
-                "argument",
-                "unexpected argument",
-            ));
-        }
-
-        // Check for unexpected properties and children.
-        for name in node.properties.keys() {
-            ctx.emit_error(DecodeError::unexpected(
+            // Within one config file, splitting sections into multiple parts is not allowed to
+            // reduce confusion. The exceptions here aren't multipart; they all add new values.
+            if !matches!(
                 name,
-                "property",
-                format!("unexpected property `{}`", name.escape_default()),
-            ));
-        }
-        for child in node.children.as_ref().map(|lst| &lst[..]).unwrap_or(&[]) {
-            ctx.emit_error(DecodeError::unexpected(
-                child,
-                "node",
-                format!("unexpected node `{}`", child.node_name.escape_default()),
-            ));
-        }
-
-        Ok(rv)
-    }
-}
-
-fn expect_only_children<S>(
-    node: &knuffel::ast::SpannedNode<S>,
-    ctx: &mut knuffel::decode::Context<S>,
-) where
-    S: knuffel::traits::ErrorSpan,
-{
-    if let Some(type_name) = &node.type_name {
-        ctx.emit_error(DecodeError::unexpected(
-            type_name,
-            "type name",
-            "no type name expected for this node",
-        ));
-    }
-
-    for val in node.arguments.iter() {
-        ctx.emit_error(DecodeError::unexpected(
-            &val.literal,
-            "argument",
-            "no arguments expected for this node",
-        ))
-    }
-
-    for name in node.properties.keys() {
-        ctx.emit_error(DecodeError::unexpected(
-            name,
-            "property",
-            "no properties expected for this node",
-        ))
-    }
-}
-
-impl FromIterator<Output> for Outputs {
-    fn from_iter<T: IntoIterator<Item = Output>>(iter: T) -> Self {
-        Self(Vec::from_iter(iter))
-    }
-}
-
-impl Outputs {
-    pub fn find(&self, name: &str) -> Option<&Output> {
-        self.0.iter().find(|o| o.name.eq_ignore_ascii_case(name))
-    }
-
-    pub fn find_mut(&mut self, name: &str) -> Option<&mut Output> {
-        self.0
-            .iter_mut()
-            .find(|o| o.name.eq_ignore_ascii_case(name))
-    }
-}
-
-impl<S> knuffel::Decode<S> for DefaultColumnWidth
-where
-    S: knuffel::traits::ErrorSpan,
-{
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        expect_only_children(node, ctx);
-
-        let mut children = node.children();
-
-        if let Some(child) = children.next() {
-            if let Some(unwanted_child) = children.next() {
+                "output"
+                    | "spawn-at-startup"
+                    | "spawn-sh-at-startup"
+                    | "window-rule"
+                    | "layer-rule"
+                    | "workspace"
+                    | "include"
+            ) && !seen.insert(name)
+            {
                 ctx.emit_error(DecodeError::unexpected(
-                    unwanted_child,
+                    &node.node_name,
                     "node",
-                    "expected no more than one child",
+                    format!("duplicate node `{name}`, single node expected"),
                 ));
-            }
-            PresetWidth::decode_node(child, ctx).map(Some).map(Self)
-        } else {
-            Ok(Self(None))
-        }
-    }
-}
-
-fn parse_arg_node<S: knuffel::traits::ErrorSpan, T: knuffel::traits::DecodeScalar<S>>(
-    name: &str,
-    node: &knuffel::ast::SpannedNode<S>,
-    ctx: &mut knuffel::decode::Context<S>,
-) -> Result<T, DecodeError<S>> {
-    let mut iter_args = node.arguments.iter();
-    let val = iter_args.next().ok_or_else(|| {
-        DecodeError::missing(node, format!("additional argument `{name}` is required"))
-    })?;
-
-    let value = knuffel::traits::DecodeScalar::decode(val, ctx)?;
-
-    if let Some(val) = iter_args.next() {
-        ctx.emit_error(DecodeError::unexpected(
-            &val.literal,
-            "argument",
-            "unexpected argument",
-        ));
-    }
-    for name in node.properties.keys() {
-        ctx.emit_error(DecodeError::unexpected(
-            name,
-            "property",
-            format!("unexpected property `{}`", name.escape_default()),
-        ));
-    }
-    for child in node.children() {
-        ctx.emit_error(DecodeError::unexpected(
-            child,
-            "node",
-            format!("unexpected node `{}`", child.node_name.escape_default()),
-        ));
-    }
-
-    Ok(value)
-}
-
-impl<S> knuffel::Decode<S> for WorkspaceSwitchAnim
-where
-    S: knuffel::traits::ErrorSpan,
-{
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        let default = Self::default().0;
-        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
-            Ok(false)
-        })?))
-    }
-}
-
-impl<S> knuffel::Decode<S> for HorizontalViewMovementAnim
-where
-    S: knuffel::traits::ErrorSpan,
-{
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        let default = Self::default().0;
-        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
-            Ok(false)
-        })?))
-    }
-}
-
-impl<S> knuffel::Decode<S> for WindowMovementAnim
-where
-    S: knuffel::traits::ErrorSpan,
-{
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        let default = Self::default().0;
-        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
-            Ok(false)
-        })?))
-    }
-}
-
-impl<S: knuffel::traits::ErrorSpan> knuffel::DecodeScalar<S> for WorkspaceName {
-    fn type_check(
-        type_name: &Option<knuffel::span::Spanned<knuffel::ast::TypeName, S>>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) {
-        if let Some(type_name) = &type_name {
-            ctx.emit_error(DecodeError::unexpected(
-                type_name,
-                "type name",
-                "no type name expected for this node",
-            ));
-        }
-    }
-
-    fn raw_decode(
-        val: &knuffel::span::Spanned<knuffel::ast::Literal, S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<WorkspaceName, DecodeError<S>> {
-        #[derive(Debug)]
-        struct WorkspaceNameSet(Vec<String>);
-        match &**val {
-            knuffel::ast::Literal::String(ref s) => {
-                let mut name_set: Vec<String> = match ctx.get::<WorkspaceNameSet>() {
-                    Some(h) => h.0.clone(),
-                    None => Vec::new(),
-                };
-
-                if name_set.iter().any(|name| name.eq_ignore_ascii_case(s)) {
-                    ctx.emit_error(DecodeError::unexpected(
-                        val,
-                        "named workspace",
-                        format!("duplicate named workspace: {}", s),
-                    ));
-                    return Ok(Self(String::new()));
-                }
-
-                name_set.push(s.to_string());
-                ctx.set(WorkspaceNameSet(name_set));
-                Ok(Self(s.clone().into()))
-            }
-            _ => {
-                ctx.emit_error(DecodeError::unsupported(
-                    val,
-                    "workspace names must be strings",
-                ));
-                Ok(Self(String::new()))
-            }
-        }
-    }
-}
-
-impl<S> knuffel::Decode<S> for WindowOpenAnim
-where
-    S: knuffel::traits::ErrorSpan,
-{
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        let default = Self::default().anim;
-        let mut custom_shader = None;
-        let anim = Animation::decode_node(node, ctx, default, |child, ctx| {
-            if &**child.node_name == "custom-shader" {
-                custom_shader = parse_arg_node("custom-shader", child, ctx)?;
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        })?;
-
-        Ok(Self {
-            anim,
-            custom_shader,
-        })
-    }
-}
-
-impl<S> knuffel::Decode<S> for WindowCloseAnim
-where
-    S: knuffel::traits::ErrorSpan,
-{
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        let default = Self::default().anim;
-        let mut custom_shader = None;
-        let anim = Animation::decode_node(node, ctx, default, |child, ctx| {
-            if &**child.node_name == "custom-shader" {
-                custom_shader = parse_arg_node("custom-shader", child, ctx)?;
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        })?;
-
-        Ok(Self {
-            anim,
-            custom_shader,
-        })
-    }
-}
-
-impl<S> knuffel::Decode<S> for WindowResizeAnim
-where
-    S: knuffel::traits::ErrorSpan,
-{
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        let default = Self::default().anim;
-        let mut custom_shader = None;
-        let anim = Animation::decode_node(node, ctx, default, |child, ctx| {
-            if &**child.node_name == "custom-shader" {
-                custom_shader = parse_arg_node("custom-shader", child, ctx)?;
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        })?;
-
-        Ok(Self {
-            anim,
-            custom_shader,
-        })
-    }
-}
-
-impl<S> knuffel::Decode<S> for ConfigNotificationOpenCloseAnim
-where
-    S: knuffel::traits::ErrorSpan,
-{
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        let default = Self::default().0;
-        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
-            Ok(false)
-        })?))
-    }
-}
-
-impl<S> knuffel::Decode<S> for ScreenshotUiOpenAnim
-where
-    S: knuffel::traits::ErrorSpan,
-{
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        let default = Self::default().0;
-        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
-            Ok(false)
-        })?))
-    }
-}
-
-impl Animation {
-    pub fn new_off() -> Self {
-        Self {
-            off: true,
-            kind: AnimationKind::Easing(EasingParams {
-                duration_ms: 0,
-                curve: AnimationCurve::Linear,
-            }),
-        }
-    }
-
-    fn decode_node<S: knuffel::traits::ErrorSpan>(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-        default: Self,
-        mut process_children: impl FnMut(
-            &knuffel::ast::SpannedNode<S>,
-            &mut knuffel::decode::Context<S>,
-        ) -> Result<bool, DecodeError<S>>,
-    ) -> Result<Self, DecodeError<S>> {
-        #[derive(Default, PartialEq)]
-        struct OptionalEasingParams {
-            duration_ms: Option<u32>,
-            curve: Option<AnimationCurve>,
-        }
-
-        expect_only_children(node, ctx);
-
-        let mut off = false;
-        let mut easing_params = OptionalEasingParams::default();
-        let mut spring_params = None;
-
-        for child in node.children() {
-            match &**child.node_name {
-                "off" => {
-                    knuffel::decode::check_flag_node(child, ctx);
-                    if off {
-                        ctx.emit_error(DecodeError::unexpected(
-                            &child.node_name,
-                            "node",
-                            "duplicate node `off`, single node expected",
-                        ));
-                    } else {
-                        off = true;
-                    }
-                }
-                "spring" => {
-                    if easing_params != OptionalEasingParams::default() {
-                        ctx.emit_error(DecodeError::unexpected(
-                            child,
-                            "node",
-                            "cannot set both spring and easing parameters at once",
-                        ));
-                    }
-                    if spring_params.is_some() {
-                        ctx.emit_error(DecodeError::unexpected(
-                            &child.node_name,
-                            "node",
-                            "duplicate node `spring`, single node expected",
-                        ));
-                    }
-
-                    spring_params = Some(SpringParams::decode_node(child, ctx)?);
-                }
-                "duration-ms" => {
-                    if spring_params.is_some() {
-                        ctx.emit_error(DecodeError::unexpected(
-                            child,
-                            "node",
-                            "cannot set both spring and easing parameters at once",
-                        ));
-                    }
-                    if easing_params.duration_ms.is_some() {
-                        ctx.emit_error(DecodeError::unexpected(
-                            &child.node_name,
-                            "node",
-                            "duplicate node `duration-ms`, single node expected",
-                        ));
-                    }
-
-                    easing_params.duration_ms = Some(parse_arg_node("duration-ms", child, ctx)?);
-                }
-                "curve" => {
-                    if spring_params.is_some() {
-                        ctx.emit_error(DecodeError::unexpected(
-                            child,
-                            "node",
-                            "cannot set both spring and easing parameters at once",
-                        ));
-                    }
-                    if easing_params.curve.is_some() {
-                        ctx.emit_error(DecodeError::unexpected(
-                            &child.node_name,
-                            "node",
-                            "duplicate node `curve`, single node expected",
-                        ));
-                    }
-
-                    easing_params.curve = Some(parse_arg_node("curve", child, ctx)?);
-                }
-                name_str => {
-                    if !process_children(child, ctx)? {
-                        ctx.emit_error(DecodeError::unexpected(
-                            child,
-                            "node",
-                            format!("unexpected node `{}`", name_str.escape_default()),
-                        ));
-                    }
-                }
-            }
-        }
-
-        let kind = if let Some(spring_params) = spring_params {
-            // Configured spring.
-            AnimationKind::Spring(spring_params)
-        } else if easing_params == OptionalEasingParams::default() {
-            // Did not configure anything.
-            default.kind
-        } else {
-            // Configured easing.
-            let default = if let AnimationKind::Easing(easing) = default.kind {
-                easing
-            } else {
-                // Generic fallback values for when the default animation is spring, but the user
-                // configured an easing animation.
-                EasingParams {
-                    duration_ms: 250,
-                    curve: AnimationCurve::EaseOutCubic,
-                }
-            };
-
-            AnimationKind::Easing(EasingParams {
-                duration_ms: easing_params.duration_ms.unwrap_or(default.duration_ms),
-                curve: easing_params.curve.unwrap_or(default.curve),
-            })
-        };
-
-        Ok(Self { off, kind })
-    }
-}
-
-impl<S> knuffel::Decode<S> for SpringParams
-where
-    S: knuffel::traits::ErrorSpan,
-{
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        if let Some(type_name) = &node.type_name {
-            ctx.emit_error(DecodeError::unexpected(
-                type_name,
-                "type name",
-                "no type name expected for this node",
-            ));
-        }
-        if let Some(val) = node.arguments.first() {
-            ctx.emit_error(DecodeError::unexpected(
-                &val.literal,
-                "argument",
-                "unexpected argument",
-            ));
-        }
-        for child in node.children() {
-            ctx.emit_error(DecodeError::unexpected(
-                child,
-                "node",
-                format!("unexpected node `{}`", child.node_name.escape_default()),
-            ));
-        }
-
-        let mut damping_ratio = None;
-        let mut stiffness = None;
-        let mut epsilon = None;
-        for (name, val) in &node.properties {
-            match &***name {
-                "damping-ratio" => {
-                    damping_ratio = Some(knuffel::traits::DecodeScalar::decode(val, ctx)?);
-                }
-                "stiffness" => {
-                    stiffness = Some(knuffel::traits::DecodeScalar::decode(val, ctx)?);
-                }
-                "epsilon" => {
-                    epsilon = Some(knuffel::traits::DecodeScalar::decode(val, ctx)?);
-                }
-                name_str => {
-                    ctx.emit_error(DecodeError::unexpected(
-                        name,
-                        "property",
-                        format!("unexpected property `{}`", name_str.escape_default()),
-                    ));
-                }
-            }
-        }
-        let damping_ratio = damping_ratio
-            .ok_or_else(|| DecodeError::missing(node, "property `damping-ratio` is required"))?;
-        let stiffness = stiffness
-            .ok_or_else(|| DecodeError::missing(node, "property `stiffness` is required"))?;
-        let epsilon =
-            epsilon.ok_or_else(|| DecodeError::missing(node, "property `epsilon` is required"))?;
-
-        if !(0.1..=10.).contains(&damping_ratio) {
-            ctx.emit_error(DecodeError::conversion(
-                node,
-                "damping-ratio must be between 0.1 and 10.0",
-            ));
-        }
-        if stiffness < 1 {
-            ctx.emit_error(DecodeError::conversion(node, "stiffness must be >= 1"));
-        }
-        if !(0.00001..=0.1).contains(&epsilon) {
-            ctx.emit_error(DecodeError::conversion(
-                node,
-                "epsilon must be between 0.00001 and 0.1",
-            ));
-        }
-
-        Ok(SpringParams {
-            damping_ratio,
-            stiffness,
-            epsilon,
-        })
-    }
-}
-
-impl<S> knuffel::Decode<S> for CornerRadius
-where
-    S: knuffel::traits::ErrorSpan,
-{
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        // Check for unexpected type name.
-        if let Some(type_name) = &node.type_name {
-            ctx.emit_error(DecodeError::unexpected(
-                type_name,
-                "type name",
-                "no type name expected for this node",
-            ));
-        }
-
-        let decode_radius = |ctx: &mut knuffel::decode::Context<S>,
-                             val: &knuffel::ast::Value<S>| {
-            // Check for unexpected type name.
-            if let Some(typ) = &val.type_name {
-                ctx.emit_error(DecodeError::TypeName {
-                    span: typ.span().clone(),
-                    found: Some((**typ).clone()),
-                    expected: knuffel::errors::ExpectedType::no_type(),
-                    rust_type: "str",
-                });
+                continue;
             }
 
-            // Decode both integers and floats.
-            let radius = match *val.literal {
-                knuffel::ast::Literal::Int(ref x) => f32::from(match x.try_into() {
-                    Ok(x) => x,
-                    Err(err) => {
-                        ctx.emit_error(DecodeError::conversion(&val.literal, err));
-                        0i16
-                    }
-                }),
-                knuffel::ast::Literal::Decimal(ref x) => match x.try_into() {
-                    Ok(x) => x,
-                    Err(err) => {
-                        ctx.emit_error(DecodeError::conversion(&val.literal, err));
-                        0.
-                    }
-                },
-                _ => {
-                    ctx.emit_error(DecodeError::scalar_kind(
-                        knuffel::decode::Kind::Int,
-                        &val.literal,
-                    ));
-                    0.
-                }
-            };
-
-            if radius < 0. {
-                ctx.emit_error(DecodeError::conversion(&val.literal, "radius must be >= 0"));
+            macro_rules! m_merge {
+                ($field:ident) => {{
+                    let part = knuffel::Decode::decode_node(node, ctx)?;
+                    config.borrow_mut().$field.merge_with(&part);
+                }};
             }
 
-            radius
-        };
-
-        // Get the first argument.
-        let mut iter_args = node.arguments.iter();
-        let val = iter_args
-            .next()
-            .ok_or_else(|| DecodeError::missing(node, "additional argument is required"))?;
-
-        let top_left = decode_radius(ctx, val);
-
-        let mut rv = CornerRadius {
-            top_left,
-            top_right: top_left,
-            bottom_right: top_left,
-            bottom_left: top_left,
-        };
-
-        if let Some(val) = iter_args.next() {
-            rv.top_right = decode_radius(ctx, val);
-
-            let val = iter_args.next().ok_or_else(|| {
-                DecodeError::missing(node, "either 1 or 4 arguments are required")
-            })?;
-            rv.bottom_right = decode_radius(ctx, val);
-
-            let val = iter_args.next().ok_or_else(|| {
-                DecodeError::missing(node, "either 1 or 4 arguments are required")
-            })?;
-            rv.bottom_left = decode_radius(ctx, val);
-
-            // Check for unexpected following arguments.
-            if let Some(val) = iter_args.next() {
-                ctx.emit_error(DecodeError::unexpected(
-                    &val.literal,
-                    "argument",
-                    "unexpected argument",
-                ));
+            macro_rules! m_push {
+                ($field:ident) => {{
+                    let part = knuffel::Decode::decode_node(node, ctx)?;
+                    config.borrow_mut().$field.push(part);
+                }};
             }
-        }
 
-        // Check for unexpected properties and children.
-        for name in node.properties.keys() {
-            ctx.emit_error(DecodeError::unexpected(
-                name,
-                "property",
-                format!("unexpected property `{}`", name.escape_default()),
-            ));
-        }
-        for child in node.children.as_ref().map(|lst| &lst[..]).unwrap_or(&[]) {
-            ctx.emit_error(DecodeError::unexpected(
-                child,
-                "node",
-                format!("unexpected node `{}`", child.node_name.escape_default()),
-            ));
-        }
+            match name {
+                "input" => m_merge!(input),
+                "cursor" => m_merge!(cursor),
+                "clipboard" => m_merge!(clipboard),
+                "hotkey-overlay" => m_merge!(hotkey_overlay),
+                "config-notification" => m_merge!(config_notification),
+                "animations" => m_merge!(animations),
+                "blur" => m_merge!(blur),
+                "gestures" => m_merge!(gestures),
+                "overview" => m_merge!(overview),
+                "xwayland-satellite" => m_merge!(xwayland_satellite),
+                "switch-events" => m_merge!(switch_events),
+                "debug" => m_merge!(debug),
 
-        Ok(rv)
-    }
-}
-
-impl<S> knuffel::Decode<S> for Binds
-where
-    S: knuffel::traits::ErrorSpan,
-{
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        expect_only_children(node, ctx);
-
-        let mut seen_keys = HashSet::new();
-
-        let mut binds = Vec::new();
-
-        for child in node.children() {
-            match Bind::decode_node(child, ctx) {
-                Err(e) => {
-                    ctx.emit_error(e);
+                // Multipart sections.
+                "output" => {
+                    let part = Output::decode_node(node, ctx)?;
+                    config.borrow_mut().outputs.0.push(part);
                 }
-                Ok(bind) => {
-                    if seen_keys.insert(bind.key) {
-                        binds.push(bind);
-                    } else {
-                        // ideally, this error should point to the previous instance of this keybind
-                        //
-                        // i (sodiboo) have tried to implement this in various ways:
-                        // miette!(), #[derive(Diagnostic)]
-                        // DecodeError::Custom, DecodeError::Conversion
-                        // nothing seems to work, and i suspect it's not possible.
-                        //
-                        // DecodeError is fairly restrictive.
-                        // even DecodeError::Custom just wraps a std::error::Error
-                        // and this erases all rich information from miette. (why???)
-                        //
-                        // why does knuffel do this?
-                        // from what i can tell, it doesn't even use DecodeError for much.
-                        // it only ever converts them to a Report anyways!
-                        // https://github.com/tailhook/knuffel/blob/c44c6b0c0f31ea6d1174d5d2ed41064922ea44ca/src/wrappers.rs#L55-L58
-                        //
-                        // besides like, allowing downstream users (such as us!)
-                        // to match on parse failure, i don't understand why
-                        // it doesn't just use a generic error type
-                        //
-                        // even the matching isn't consistent,
-                        // because errors can also be omitted as ctx.emit_error.
-                        // why does *that one* especially, require a DecodeError?
-                        //
-                        // anyways if you can make it format nicely, definitely do fix this
-                        ctx.emit_error(DecodeError::unexpected(
-                            &child.node_name,
-                            "keybind",
-                            "duplicate keybind",
-                        ));
-                    }
+                "spawn-at-startup" => m_push!(spawn_at_startup),
+                "spawn-sh-at-startup" => m_push!(spawn_sh_at_startup),
+                "window-rule" => m_push!(window_rules),
+                "layer-rule" => m_push!(layer_rules),
+                "workspace" => m_push!(workspaces),
+
+                // Single-part sections.
+                "binds" => {
+                    let part = Binds::decode_node(node, ctx)?;
+
+                    // We replace conflicting binds, rather than error, to support the use-case
+                    // where you import some preconfigured-dots.kdl, then override some binds with
+                    // your own.
+                    let mut config = config.borrow_mut();
+                    let binds = &mut config.binds.0;
+                    // Remove existing binds matching any new bind.
+                    binds.retain(|bind| !part.0.iter().any(|new| new.key == bind.key));
+                    // Add all new binds.
+                    binds.extend(part.0);
                 }
-            }
-        }
-
-        Ok(Self(binds))
-    }
-}
-
-impl<S> knuffel::Decode<S> for Bind
-where
-    S: knuffel::traits::ErrorSpan,
-{
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        if let Some(type_name) = &node.type_name {
-            ctx.emit_error(DecodeError::unexpected(
-                type_name,
-                "type name",
-                "no type name expected for this node",
-            ));
-        }
-
-        for val in node.arguments.iter() {
-            ctx.emit_error(DecodeError::unexpected(
-                &val.literal,
-                "argument",
-                "no arguments expected for this node",
-            ));
-        }
-
-        let key = node
-            .node_name
-            .parse::<Key>()
-            .map_err(|e| DecodeError::conversion(&node.node_name, e.wrap_err("invalid keybind")))?;
-
-        let mut repeat = true;
-        let mut cooldown = None;
-        let mut allow_when_locked = false;
-        let mut allow_when_locked_node = None;
-        for (name, val) in &node.properties {
-            match &***name {
-                "repeat" => {
-                    repeat = knuffel::traits::DecodeScalar::decode(val, ctx)?;
+                "environment" => {
+                    let part = Environment::decode_node(node, ctx)?;
+                    config.borrow_mut().environment.0.extend(part.0);
                 }
-                "cooldown-ms" => {
-                    cooldown = Some(Duration::from_millis(
-                        knuffel::traits::DecodeScalar::decode(val, ctx)?,
-                    ));
-                }
-                "allow-when-locked" => {
-                    allow_when_locked = knuffel::traits::DecodeScalar::decode(val, ctx)?;
-                    allow_when_locked_node = Some(name);
-                }
-                name_str => {
-                    ctx.emit_error(DecodeError::unexpected(
-                        name,
-                        "property",
-                        format!("unexpected property `{}`", name_str.escape_default()),
-                    ));
-                }
-            }
-        }
 
-        let mut children = node.children();
+                "prefer-no-csd" => {
+                    config.borrow_mut().prefer_no_csd = Flag::decode_node(node, ctx)?.0
+                }
 
-        // If the action is invalid but the key is fine, we still want to return something.
-        // That way, the parent can handle the existence of duplicate keybinds,
-        // even if their contents are not valid.
-        let dummy = Self {
-            key,
-            action: Action::Spawn(vec![]),
-            repeat: true,
-            cooldown: None,
-            allow_when_locked: false,
-        };
+                "screenshot-path" => {
+                    let part = knuffel::Decode::decode_node(node, ctx)?;
+                    config.borrow_mut().screenshot_path = part;
+                }
 
-        if let Some(child) = children.next() {
-            for unwanted_child in children {
-                ctx.emit_error(DecodeError::unexpected(
-                    unwanted_child,
-                    "node",
-                    "only one action is allowed per keybind",
-                ));
-            }
-            match Action::decode_node(child, ctx) {
-                Ok(action) => {
-                    if !matches!(action, Action::Spawn(_)) {
-                        if let Some(node) = allow_when_locked_node {
-                            ctx.emit_error(DecodeError::unexpected(
-                                node,
-                                "property",
-                                "allow-when-locked can only be set on spawn binds",
-                            ));
+                "layout" => {
+                    let mut part = LayoutPart::decode_node(node, ctx)?;
+
+                    // Preserve the behavior we'd always had for the border section:
+                    // - `layout {}` gives border = off
+                    // - `layout { border {} }` gives border = on
+                    // - `layout { border { off } }` gives border = off
+                    //
+                    // This behavior is inconsistent with the rest of the config where adding an
+                    // empty section generally doesn't change the outcome. Particularly, shadows
+                    // are also disabled by default (like borders), and they always had an `on`
+                    // instead of an `off` for this reason, so that writing `layout { shadow {} }`
+                    // still results in shadow = off, as it should.
+                    //
+                    // Unfortunately, the default config has always had wording that heavily
+                    // implies that `layout { border {} }` enables the borders. This wording is
+                    // sure to be present in a lot of users' configs by now, which we can't change.
+                    //
+                    // Another way to make things consistent would be to default borders to on.
+                    // However, that is annoying because it would mean changing many tests that
+                    // rely on borders being off by default. This would also contradict the
+                    // intended default borders value (off).
+                    //
+                    // So, let's just work around the problem here, preserving the original
+                    // behavior.
+                    if recursion == 0 {
+                        if let Some(border) = part.border.as_mut() {
+                            if !border.on && !border.off {
+                                border.on = true;
+                            }
                         }
                     }
 
-                    Ok(Self {
-                        key,
-                        action,
-                        repeat,
-                        cooldown,
-                        allow_when_locked,
-                    })
+                    config.borrow_mut().layout.merge_with(&part);
                 }
-                Err(e) => {
-                    ctx.emit_error(e);
-                    Ok(dummy)
+
+                "recent-windows" => {
+                    let part = RecentWindowsPart::decode_node(node, ctx)?;
+
+                    let mut config = config.borrow_mut();
+
+                    // When an MRU binds section is encountered for the first time, clear out the
+                    // default MRU binds.
+                    if !saw_mru_binds.get() && part.binds.is_some() {
+                        saw_mru_binds.set(true);
+                        config.recent_windows.binds.clear();
+                    }
+
+                    config.recent_windows.merge_with(&part);
+                }
+
+                "include" => {
+                    // Parse the path argument
+                    let mut iter_args = node.arguments.iter();
+                    let path_val = iter_args.next().ok_or_else(|| {
+                        DecodeError::missing(
+                            node,
+                            "additional argument for include path is required",
+                        )
+                    })?;
+                    let path: PathBuf = knuffel::traits::DecodeScalar::decode(path_val, ctx)?;
+
+                    // Check for extra arguments
+                    if let Some(val) = iter_args.next() {
+                        ctx.emit_error(DecodeError::unexpected(
+                            &val.literal,
+                            "argument",
+                            "unexpected argument",
+                        ));
+                    }
+
+                    // Parse the optional property
+                    let mut optional = false;
+                    for (name, val) in &node.properties {
+                        match &***name {
+                            "optional" => {
+                                optional = knuffel::traits::DecodeScalar::decode(val, ctx)?;
+                            }
+                            name_str => {
+                                ctx.emit_error(DecodeError::unexpected(
+                                    name,
+                                    "property",
+                                    format!("unexpected property `{}`", name_str.escape_default()),
+                                ));
+                            }
+                        }
+                    }
+
+                    // Check for unexpected children
+                    for child in node.children() {
+                        ctx.emit_error(DecodeError::unexpected(
+                            child,
+                            "node",
+                            format!("unexpected node `{}`", child.node_name.escape_default()),
+                        ));
+                    }
+
+                    // We use DecodeError::Missing throughout this block because it results in the
+                    // least confusing error messages while still allowing to provide a span.
+
+                    // Expand ~ into the home dir
+                    let path = if let Ok(rest) = path.strip_prefix("~") {
+                        let Some(home) = std::env::home_dir() else {
+                            ctx.emit_error(DecodeError::missing(
+                                node,
+                                format!("error retrieving home directory to expand {path:?}"),
+                            ));
+                            continue;
+                        };
+
+                        home.join(rest)
+                    } else {
+                        // Otherwise, use the current include base dir
+                        let base = ctx.get::<BasePath>().unwrap();
+                        base.0.join(path)
+                    };
+
+                    let recursion = ctx.get::<Recursion>().unwrap().0 + 1;
+                    if recursion == RECURSION_LIMIT {
+                        ctx.emit_error(DecodeError::missing(
+                            node,
+                            format!(
+                                "reached the recursion limit; \
+                                 includes cannot be {RECURSION_LIMIT} levels deep"
+                            ),
+                        ));
+                        continue;
+                    }
+
+                    let Some(filename) = path.file_name().and_then(OsStr::to_str) else {
+                        ctx.emit_error(DecodeError::missing(
+                            node,
+                            "include path doesn't have a valid file name",
+                        ));
+                        continue;
+                    };
+                    let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
+
+                    // Check for recursive include for a nicer error message.
+                    let mut include_stack = ctx.get::<IncludeStack>().unwrap().0.clone();
+                    if !include_stack.insert(path.to_path_buf()) {
+                        ctx.emit_error(DecodeError::missing(
+                            node,
+                            "recursive include (file includes itself)",
+                        ));
+                        continue;
+                    }
+
+                    // Store even if the include fails to read or parse, so it gets watched.
+                    includes.borrow_mut().0.push(path.to_path_buf());
+
+                    match fs::read_to_string(&path) {
+                        Ok(text) => {
+                            // Try to get filename relative to the root base config folder for
+                            // clearer error messages.
+                            let root_base = &ctx.get::<RootBase>().unwrap().0;
+                            // Failing to strip prefix usually means absolute path; show it in full.
+                            let relative_path = path.strip_prefix(root_base).ok().unwrap_or(&path);
+                            let filename = relative_path.to_str().unwrap_or(filename);
+
+                            let part = knuffel::parse_with_context::<
+                                ConfigPart,
+                                knuffel::span::Span,
+                                _,
+                            >(filename, &text, |ctx| {
+                                ctx.set(BasePath(base));
+                                ctx.set(RootBase(root_base.clone()));
+                                ctx.set(Recursion(recursion));
+                                ctx.set(includes.clone());
+                                ctx.set(include_errors.clone());
+                                ctx.set(IncludeStack(include_stack));
+                                ctx.set(SawMruBinds(saw_mru_binds.clone()));
+                                ctx.set(config.clone());
+                            });
+
+                            match part {
+                                Ok(_) => {}
+                                Err(err) => {
+                                    include_errors.borrow_mut().0.push(err);
+
+                                    ctx.emit_error(DecodeError::missing(
+                                        node,
+                                        "failed to parse included config",
+                                    ));
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if optional && err.kind() == std::io::ErrorKind::NotFound {
+                                // Warn about missing optional includes
+                                warn!("optional include not found: {path:?}");
+                            } else {
+                                // Report all other errors normally
+                                ctx.emit_error(DecodeError::missing(
+                                    node,
+                                    format!("failed to read included config from {path:?}: {err}"),
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                name => {
+                    ctx.emit_error(DecodeError::unexpected(
+                        node,
+                        "node",
+                        format!("unexpected node `{}`", name.escape_default()),
+                    ));
                 }
             }
-        } else {
-            ctx.emit_error(DecodeError::missing(
-                node,
-                "expected an action for this keybind",
-            ));
-            Ok(dummy)
         }
+
+        Ok(Self)
     }
 }
 
-impl FromStr for Key {
-    type Err = miette::Error;
+impl Config {
+    pub fn load_default() -> Self {
+        let res = Config::parse(
+            Path::new("default-config.kdl"),
+            include_str!("../../resources/default-config.kdl"),
+        );
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut modifiers = Modifiers::empty();
+        // Includes in the default config can break its parsing at runtime.
+        assert!(
+            res.includes.is_empty(),
+            "default config must not have includes",
+        );
 
-        let mut split = s.split('+');
-        let key = split.next_back().unwrap();
+        res.config.unwrap()
+    }
 
-        for part in split {
-            let part = part.trim();
-            if part.eq_ignore_ascii_case("mod") {
-                modifiers |= Modifiers::COMPOSITOR
-            } else if part.eq_ignore_ascii_case("ctrl") || part.eq_ignore_ascii_case("control") {
-                modifiers |= Modifiers::CTRL;
-            } else if part.eq_ignore_ascii_case("shift") {
-                modifiers |= Modifiers::SHIFT;
-            } else if part.eq_ignore_ascii_case("alt") {
-                modifiers |= Modifiers::ALT;
-            } else if part.eq_ignore_ascii_case("super") || part.eq_ignore_ascii_case("win") {
-                modifiers |= Modifiers::SUPER;
-            } else if part.eq_ignore_ascii_case("iso_level3_shift")
-                || part.eq_ignore_ascii_case("mod5")
-            {
-                modifiers |= Modifiers::ISO_LEVEL3_SHIFT;
-            } else {
-                return Err(miette!("invalid modifier: {part}"));
+    pub fn load(path: &Path) -> ConfigParseResult<Self, miette::Report> {
+        let contents = match fs::read_to_string(path) {
+            Ok(x) => x,
+            Err(err) => {
+                return ConfigParseResult::from_err(
+                    miette!(err).context(format!("error reading {path:?}")),
+                );
             }
-        }
-
-        let trigger = if key.eq_ignore_ascii_case("WheelScrollDown") {
-            Trigger::WheelScrollDown
-        } else if key.eq_ignore_ascii_case("WheelScrollUp") {
-            Trigger::WheelScrollUp
-        } else if key.eq_ignore_ascii_case("WheelScrollLeft") {
-            Trigger::WheelScrollLeft
-        } else if key.eq_ignore_ascii_case("WheelScrollRight") {
-            Trigger::WheelScrollRight
-        } else if key.eq_ignore_ascii_case("TouchpadScrollDown") {
-            Trigger::TouchpadScrollDown
-        } else if key.eq_ignore_ascii_case("TouchpadScrollUp") {
-            Trigger::TouchpadScrollUp
-        } else if key.eq_ignore_ascii_case("TouchpadScrollLeft") {
-            Trigger::TouchpadScrollLeft
-        } else if key.eq_ignore_ascii_case("TouchpadScrollRight") {
-            Trigger::TouchpadScrollRight
-        } else {
-            let keysym = keysym_from_name(key, KEYSYM_CASE_INSENSITIVE);
-            if keysym.raw() == KEY_NoSymbol {
-                return Err(miette!("invalid key: {key}"));
-            }
-            Trigger::Keysym(keysym)
         };
 
-        Ok(Key { trigger, modifiers })
+        Self::parse(path, &contents).map_config_res(|res| {
+            let config = res.context("error parsing")?;
+            debug!("loaded config from {path:?}");
+            Ok(config)
+        })
+    }
+
+    pub fn parse(path: &Path, text: &str) -> ConfigParseResult<Self, ConfigIncludeError> {
+        let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let filename = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("config.kdl");
+
+        let config = Rc::new(RefCell::new(Config::default()));
+        let includes = Rc::new(RefCell::new(Includes(Vec::new())));
+        let include_errors = Rc::new(RefCell::new(IncludeErrors(Vec::new())));
+        let include_stack = HashSet::from([path.to_path_buf()]);
+
+        let part = knuffel::parse_with_context::<ConfigPart, knuffel::span::Span, _>(
+            filename,
+            text,
+            |ctx| {
+                ctx.set(BasePath(base.clone()));
+                ctx.set(RootBase(base));
+                ctx.set(Recursion(0));
+                ctx.set(includes.clone());
+                ctx.set(include_errors.clone());
+                ctx.set(IncludeStack(include_stack));
+                ctx.set(SawMruBinds(Rc::new(Cell::new(false))));
+                ctx.set(config.clone());
+            },
+        );
+
+        let includes = includes.take().0;
+        let include_errors = include_errors.take().0;
+        let config = part
+            .map(|_| config.take())
+            .map_err(move |err| ConfigIncludeError {
+                main: err,
+                includes: include_errors,
+            });
+
+        ConfigParseResult { config, includes }
+    }
+
+    pub fn parse_mem(text: &str) -> Result<Self, ConfigIncludeError> {
+        Self::parse(Path::new("config.kdl"), text).config
     }
 }
 
-impl FromStr for ClickMethod {
-    type Err = miette::Error;
+impl ConfigPath {
+    /// Loads the config, returns an error if it doesn't exist.
+    pub fn load(&self) -> ConfigParseResult<Config, miette::Report> {
+        let _span = tracy_client::span!("ConfigPath::load");
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "clickfinger" => Ok(Self::Clickfinger),
-            "button-areas" => Ok(Self::ButtonAreas),
-            _ => Err(miette!(
-                r#"invalid click method, can be "button-areas" or "clickfinger""#
-            )),
-        }
+        self.load_inner(|user_path, system_path| {
+            Err(miette!(
+                "no config file found; create one at {user_path:?} or {system_path:?}",
+            ))
+        })
+        .map_config_res(|res| res.context("error loading config"))
     }
-}
 
-impl FromStr for AccelProfile {
-    type Err = miette::Error;
+    /// Loads the config, or creates it if it doesn't exist.
+    ///
+    /// Returns a tuple containing the path that was created, if any, and the loaded config.
+    ///
+    /// If the config was created, but for some reason could not be read afterwards,
+    /// this may return `(Some(_), Err(_))`.
+    pub fn load_or_create(&self) -> (Option<&Path>, ConfigParseResult<Config, miette::Report>) {
+        let _span = tracy_client::span!("ConfigPath::load_or_create");
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "adaptive" => Ok(Self::Adaptive),
-            "flat" => Ok(Self::Flat),
-            _ => Err(miette!(
-                r#"invalid accel profile, can be "adaptive" or "flat""#
-            )),
-        }
+        let mut created_at = None;
+
+        let result = self
+            .load_inner(|user_path, _| {
+                Self::create(user_path, &mut created_at)
+                    .map(|()| user_path)
+                    .with_context(|| format!("error creating config at {user_path:?}"))
+            })
+            .map_config_res(|res| res.context("error loading config"));
+
+        (created_at, result)
     }
-}
 
-impl FromStr for ScrollMethod {
-    type Err = miette::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "no-scroll" => Ok(Self::NoScroll),
-            "two-finger" => Ok(Self::TwoFinger),
-            "edge" => Ok(Self::Edge),
-            "on-button-down" => Ok(Self::OnButtonDown),
-            _ => Err(miette!(
-                r#"invalid scroll method, can be "no-scroll", "two-finger", "edge", or "on-button-down""#
-            )),
-        }
-    }
-}
-
-impl FromStr for TapButtonMap {
-    type Err = miette::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "left-right-middle" => Ok(Self::LeftRightMiddle),
-            "left-middle-right" => Ok(Self::LeftMiddleRight),
-            _ => Err(miette!(
-                r#"invalid tap button map, can be "left-right-middle" or "left-middle-right""#
-            )),
-        }
-    }
-}
-
-impl FromStr for Percent {
-    type Err = miette::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let Some((value, empty)) = s.split_once('%') else {
-            return Err(miette!("value must end with '%'"));
+    fn load_inner<'a>(
+        &'a self,
+        maybe_create: impl FnOnce(&'a Path, &'a Path) -> miette::Result<&'a Path>,
+    ) -> ConfigParseResult<Config, miette::Report> {
+        let path = match self {
+            ConfigPath::Explicit(path) => path.as_path(),
+            ConfigPath::Regular {
+                user_path,
+                system_path,
+            } => {
+                if user_path.exists() {
+                    user_path.as_path()
+                } else if system_path.exists() {
+                    system_path.as_path()
+                } else {
+                    match maybe_create(user_path.as_path(), system_path.as_path()) {
+                        Ok(x) => x,
+                        Err(err) => return ConfigParseResult::from_err(miette!(err)),
+                    }
+                }
+            }
         };
+        Config::load(path)
+    }
 
-        if !empty.is_empty() {
-            return Err(miette!("trailing characters after '%' are not allowed"));
+    fn create<'a>(path: &'a Path, created_at: &mut Option<&'a Path>) -> miette::Result<()> {
+        if let Some(default_parent) = path.parent() {
+            fs::create_dir_all(default_parent)
+                .into_diagnostic()
+                .with_context(|| format!("error creating config directory {default_parent:?}"))?;
         }
 
-        let value: f64 = value.parse().map_err(|_| miette!("error parsing value"))?;
-        Ok(Percent(value / 100.))
-    }
-}
+        // Create the config and fill it with the default config if it doesn't exist.
+        let mut new_file = match File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            res => res,
+        }
+        .into_diagnostic()
+        .with_context(|| format!("error opening config file at {path:?}"))?;
 
-pub fn set_miette_hook() -> Result<(), miette::InstallError> {
-    miette::set_hook(Box::new(|_| Box::new(NarratableReportHandler::new())))
+        *created_at = Some(path);
+
+        let default = include_bytes!("../../resources/default-config.kdl");
+
+        new_file
+            .write_all(default)
+            .into_diagnostic()
+            .with_context(|| format!("error writing default config to {path:?}"))?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use insta::{assert_debug_snapshot, assert_snapshot};
     use pretty_assertions::assert_eq;
 
     use super::*;
 
-    #[track_caller]
-    fn check(text: &str, expected: Config) {
-        let _ = set_miette_hook();
+    #[test]
+    fn can_create_default_config() {
+        let _ = Config::load_default();
+    }
 
-        let parsed = Config::parse("test.kdl", text)
+    #[test]
+    fn default_repeat_params() {
+        let config = Config::parse_mem("").unwrap();
+        assert_eq!(config.input.keyboard.repeat_delay, 600);
+        assert_eq!(config.input.keyboard.repeat_rate, 25);
+    }
+
+    #[track_caller]
+    fn do_parse(text: &str) -> Config {
+        Config::parse_mem(text)
             .map_err(miette::Report::new)
-            .unwrap();
-        assert_eq!(parsed, expected);
+            .unwrap()
+    }
+
+    #[test]
+    fn parse_on_xdg_activate() {
+        let parsed = do_parse(
+            r#"
+            window-rule { on-xdg-activate "ignore"; }
+            window-rule { on-xdg-activate "set-urgent"; }
+            window-rule { on-xdg-activate "focus"; }
+            "#,
+        );
+
+        assert_eq!(
+            parsed
+                .window_rules
+                .iter()
+                .map(|rule| rule.on_xdg_activate)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(OnXdgActivate::Ignore),
+                Some(OnXdgActivate::SetUrgent),
+                Some(OnXdgActivate::Focus),
+            ]
+        );
     }
 
     #[test]
     fn parse() {
-        check(
+        let parsed = do_parse(
             r##"
             input {
                 keyboard {
@@ -2656,12 +698,16 @@ mod tests {
                     tap
                     dwt
                     dwtp
+                    drag true
                     click-method "clickfinger"
                     accel-speed 0.2
                     accel-profile "flat"
                     scroll-method "two-finger"
+                    scroll-button 272
+                    scroll-button-lock
                     tap-button-map "left-middle-right"
                     disabled-on-external-mouse
+                    scroll-factor 0.9
                 }
 
                 mouse {
@@ -2669,7 +715,9 @@ mod tests {
                     accel-speed 0.4
                     accel-profile "flat"
                     scroll-method "no-scroll"
+                    scroll-button 273
                     middle-emulation
+                    scroll-factor 0.2
                 }
 
                 trackpoint {
@@ -2678,10 +726,27 @@ mod tests {
                     accel-speed 0.0
                     accel-profile "flat"
                     scroll-method "on-button-down"
+                    scroll-button 274
+                }
+
+                trackball {
+                    off
+                    natural-scroll
+                    accel-speed 0.0
+                    accel-profile "flat"
+                    scroll-method "edge"
+                    scroll-button 275
+                    scroll-button-lock
+                    left-handed
+                    middle-emulation
                 }
 
                 tablet {
                     map-to-output "eDP-1"
+                    map-to-focused-output
+                    map-to-focused-window
+                    calibration-matrix 1.0 2.0 3.0 \
+                                       4.0 5.0 6.0
                 }
 
                 touch {
@@ -2693,15 +758,35 @@ mod tests {
                 warp-mouse-to-focus
                 focus-follows-mouse
                 workspace-auto-back-and-forth
+
+                mod-key "Mod5"
+                mod-key-nested "Super"
             }
 
             output "eDP-1" {
+                focus-at-startup
                 scale 2
                 transform "flipped-90"
                 position x=10 y=20
                 mode "1920x1080@144"
-                variable-refresh-rate
+                max-bpc 10
+                variable-refresh-rate on-demand=true
                 background-color "rgba(25, 25, 102, 1.0)"
+                hot-corners {
+                    off
+                    top-left
+                    top-right
+                    bottom-left
+                    bottom-right
+                }
+            }
+
+            output "eDP-2" {
+                mode custom=true "1920x1080@144"
+            }
+
+            output "eDP-3" {
+                modeline 173.00  1920 2048 2248 2576  1080 1083 1088 1120 "-hsync" "+vsync"
             }
 
             layout {
@@ -2717,7 +802,23 @@ mod tests {
                     inactive-color "rgba(255, 200, 100, 0.0)"
                 }
 
+                shadow {
+                    offset x=10 y=-20
+                }
+
+                tab-indicator {
+                    width 10
+                    position "top"
+                }
+
                 preset-column-widths {
+                    proportion 0.25
+                    proportion 0.5
+                    fixed 960
+                    fixed 1280
+                }
+
+                preset-window-heights {
                     proportion 0.25
                     proportion 0.5
                     fixed 960
@@ -2735,18 +836,32 @@ mod tests {
                 }
 
                 center-focused-column "on-overflow"
+
+                default-column-display "tabbed"
+
+                insert-hint {
+                    color "rgb(255, 200, 127)"
+                    gradient from="rgba(10, 20, 30, 1.0)" to="#0080ffff" relative-to="workspace-view"
+                }
             }
 
             spawn-at-startup "alacritty" "-e" "fish"
+            spawn-sh-at-startup "qs -c ~/source/qs/MyAwesomeShell"
 
             prefer-no-csd
 
             cursor {
                 xcursor-theme "breeze_cursors"
                 xcursor-size 16
+                hide-when-typing
+                hide-after-inactive-ms 3000
             }
 
             screenshot-path "~/Screenshots/screenshot.png"
+
+            clipboard {
+                disable-primary
+            }
 
             hotkey-overlay {
                 skip-at-startup
@@ -2765,6 +880,21 @@ mod tests {
                 }
 
                 window-open { off; }
+
+                window-close {
+                    curve "cubic-bezier" 0.05 0.7 0.1 1
+                }
+
+                recent-windows-close {
+                    off
+                }
+            }
+
+            gestures {
+                dnd-edge-view-scroll {
+                    trigger-width 10
+                    max-speed 50
+                }
             }
 
             environment {
@@ -2780,6 +910,12 @@ mod tests {
                 open-on-output "eDP-1"
                 open-maximized true
                 open-fullscreen false
+                open-floating false
+                open-focused true
+                default-window-height { fixed 500; }
+                default-column-display "tabbed"
+                default-floating-position x=100 y=-200 relative-to="bottom-left"
+                on-xdg-activate "ignore"
 
                 focus-ring {
                     off
@@ -2790,22 +926,44 @@ mod tests {
                     on
                     width 8.5
                 }
+
+                tab-indicator {
+                    active-color "#f00"
+                }
+            }
+
+            layer-rule {
+                match namespace="^notifications$"
+                block-out-from "screencast"
             }
 
             binds {
+                Mod+Escape hotkey-overlay-title="Inhibit" { toggle-keyboard-shortcuts-inhibit; }
+                Mod+Shift+Escape allow-inhibiting=true { toggle-keyboard-shortcuts-inhibit; }
                 Mod+T allow-when-locked=true { spawn "alacritty"; }
-                Mod+Q { close-window; }
+                Mod+Q hotkey-overlay-title=null { close-window; }
                 Mod+Shift+H { focus-monitor-left; }
+                Mod+Shift+O { focus-monitor "eDP-1"; }
                 Mod+Ctrl+Shift+L { move-window-to-monitor-right; }
+                Mod+Ctrl+Alt+O { move-window-to-monitor "eDP-1"; }
+                Mod+Ctrl+Alt+P { move-column-to-monitor "DP-1"; }
                 Mod+Comma { consume-window-into-column; }
                 Mod+1 { focus-workspace 1; }
                 Mod+Shift+1 { focus-workspace "workspace-1"; }
-                Mod+Shift+E { quit skip-confirmation=true; }
+                Mod+Shift+E allow-inhibiting=false { quit skip-confirmation=true; }
                 Mod+WheelScrollDown cooldown-ms=150 { focus-workspace-down; }
+                Super+Alt+S allow-when-locked=true { spawn-sh "pkill orca || exec orca"; }
+            }
+
+            switch-events {
+                tablet-mode-on { spawn "bash" "-c" "gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled true"; }
+                tablet-mode-off { spawn "bash" "-c" "gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled false"; }
             }
 
             debug {
                 render-drm-device "/dev/dri/renderD129"
+                ignore-drm-device "/dev/dri/renderD128"
+                ignore-drm-device "/dev/dri/renderD130"
             }
 
             workspace "workspace-1" {
@@ -2813,489 +971,1537 @@ mod tests {
             }
             workspace "workspace-2"
             workspace "workspace-3"
+
+            recent-windows {
+                off
+
+                highlight {
+                    padding 15
+                    active-color "#00ff00"
+                }
+
+                previews {
+                    max-height 960
+                }
+
+                binds {
+                    Alt+Tab { next-window; }
+                    Alt+grave { next-window filter="app-id"; }
+                    Super+Tab { next-window scope="output"; }
+                }
+            }
             "##,
-            Config {
-                input: Input {
-                    keyboard: Keyboard {
-                        xkb: Xkb {
-                            layout: "us,ru".to_owned(),
-                            options: Some("grp:win_space_toggle".to_owned()),
-                            ..Default::default()
-                        },
-                        repeat_delay: 600,
-                        repeat_rate: 25,
-                        track_layout: TrackLayout::Window,
+        );
+
+        assert_debug_snapshot!(parsed, @r#"
+        Config {
+            input: Input {
+                keyboard: Keyboard {
+                    xkb: Xkb {
+                        rules: "",
+                        model: "",
+                        layout: "us,ru",
+                        variant: "",
+                        options: Some(
+                            "grp:win_space_toggle",
+                        ),
+                        file: None,
                     },
-                    touchpad: Touchpad {
-                        off: false,
-                        tap: true,
-                        dwt: true,
-                        dwtp: true,
-                        click_method: Some(ClickMethod::Clickfinger),
-                        natural_scroll: false,
-                        accel_speed: 0.2,
-                        accel_profile: Some(AccelProfile::Flat),
-                        scroll_method: Some(ScrollMethod::TwoFinger),
-                        tap_button_map: Some(TapButtonMap::LeftMiddleRight),
-                        left_handed: false,
-                        disabled_on_external_mouse: true,
-                        middle_emulation: false,
-                    },
-                    mouse: Mouse {
-                        off: false,
-                        natural_scroll: true,
-                        accel_speed: 0.4,
-                        accel_profile: Some(AccelProfile::Flat),
-                        scroll_method: Some(ScrollMethod::NoScroll),
-                        left_handed: false,
-                        middle_emulation: true,
-                    },
-                    trackpoint: Trackpoint {
-                        off: true,
-                        natural_scroll: true,
-                        accel_speed: 0.0,
-                        accel_profile: Some(AccelProfile::Flat),
-                        scroll_method: Some(ScrollMethod::OnButtonDown),
-                        middle_emulation: false,
-                    },
-                    tablet: Tablet {
-                        off: false,
-                        map_to_output: Some("eDP-1".to_owned()),
-                        left_handed: false,
-                    },
-                    touch: Touch {
-                        map_to_output: Some("eDP-1".to_owned()),
-                    },
-                    disable_power_key_handling: true,
-                    warp_mouse_to_focus: true,
-                    focus_follows_mouse: Some(FocusFollowsMouse {
-                        max_scroll_amount: None,
-                    }),
-                    workspace_auto_back_and_forth: true,
+                    repeat_delay: 600,
+                    repeat_rate: 25,
+                    track_layout: Window,
+                    numlock: false,
                 },
-                outputs: Outputs(vec![Output {
+                touchpad: Touchpad {
                     off: false,
-                    name: "eDP-1".to_owned(),
-                    scale: Some(FloatOrInt(2.)),
-                    transform: Transform::Flipped90,
-                    position: Some(Position { x: 10, y: 20 }),
-                    mode: Some(ConfiguredMode {
-                        width: 1920,
-                        height: 1080,
-                        refresh: Some(144.),
-                    }),
-                    variable_refresh_rate: true,
-                    background_color: Color::from_rgba8_unpremul(25, 25, 102, 255),
-                }]),
-                layout: Layout {
-                    focus_ring: FocusRing {
-                        off: false,
-                        width: FloatOrInt(5.),
-                        active_color: Color::from_rgba8_unpremul(0, 100, 200, 255),
-                        inactive_color: Color::from_rgba8_unpremul(255, 200, 100, 0),
-                        active_gradient: Some(Gradient {
-                            from: Color::from_rgba8_unpremul(10, 20, 30, 255),
-                            to: Color::from_rgba8_unpremul(0, 128, 255, 255),
-                            angle: 180,
-                            relative_to: GradientRelativeTo::WorkspaceView,
-                            in_: GradientInterpolation {
-                                color_space: GradientColorSpace::Srgb,
-                                hue_interpolation: HueInterpolation::Shorter,
-                            },
-                        }),
-                        inactive_gradient: None,
-                    },
-                    border: Border {
-                        off: false,
-                        width: FloatOrInt(3.),
-                        active_color: Color::from_rgba8_unpremul(255, 200, 127, 255),
-                        inactive_color: Color::from_rgba8_unpremul(255, 200, 100, 0),
-                        active_gradient: None,
-                        inactive_gradient: None,
-                    },
-                    preset_column_widths: vec![
-                        PresetWidth::Proportion(0.25),
-                        PresetWidth::Proportion(0.5),
-                        PresetWidth::Fixed(960),
-                        PresetWidth::Fixed(1280),
-                    ],
-                    default_column_width: Some(DefaultColumnWidth(Some(PresetWidth::Proportion(
-                        0.25,
-                    )))),
-                    gaps: FloatOrInt(8.),
-                    struts: Struts {
-                        left: FloatOrInt(1.),
-                        right: FloatOrInt(2.),
-                        top: FloatOrInt(3.),
-                        bottom: FloatOrInt(0.),
-                    },
-                    center_focused_column: CenterFocusedColumn::OnOverflow,
-                },
-                spawn_at_startup: vec![SpawnAtStartup {
-                    command: vec!["alacritty".to_owned(), "-e".to_owned(), "fish".to_owned()],
-                }],
-                prefer_no_csd: true,
-                cursor: Cursor {
-                    xcursor_theme: String::from("breeze_cursors"),
-                    xcursor_size: 16,
-                },
-                screenshot_path: Some(String::from("~/Screenshots/screenshot.png")),
-                hotkey_overlay: HotkeyOverlay {
-                    skip_at_startup: true,
-                },
-                animations: Animations {
-                    slowdown: 2.,
-                    workspace_switch: WorkspaceSwitchAnim(Animation {
-                        off: false,
-                        kind: AnimationKind::Spring(SpringParams {
-                            damping_ratio: 1.,
-                            stiffness: 1000,
-                            epsilon: 0.0001,
-                        }),
-                    }),
-                    horizontal_view_movement: HorizontalViewMovementAnim(Animation {
-                        off: false,
-                        kind: AnimationKind::Easing(EasingParams {
-                            duration_ms: 100,
-                            curve: AnimationCurve::EaseOutExpo,
-                        }),
-                    }),
-                    window_open: WindowOpenAnim {
-                        anim: Animation {
-                            off: true,
-                            ..WindowOpenAnim::default().anim
+                    tap: true,
+                    dwt: true,
+                    dwtp: true,
+                    drag: Some(
+                        true,
+                    ),
+                    drag_lock: false,
+                    natural_scroll: false,
+                    click_method: Some(
+                        Clickfinger,
+                    ),
+                    accel_speed: FloatOrInt(
+                        0.2,
+                    ),
+                    accel_profile: Some(
+                        Flat,
+                    ),
+                    scroll_method: Some(
+                        TwoFinger,
+                    ),
+                    scroll_button: Some(
+                        272,
+                    ),
+                    scroll_button_lock: true,
+                    tap_button_map: Some(
+                        LeftMiddleRight,
+                    ),
+                    left_handed: false,
+                    disabled_on_external_mouse: true,
+                    middle_emulation: false,
+                    scroll_factor: Some(
+                        ScrollFactor {
+                            base: Some(
+                                FloatOrInt(
+                                    0.9,
+                                ),
+                            ),
+                            horizontal: None,
+                            vertical: None,
                         },
-                        custom_shader: None,
-                    },
-                    ..Default::default()
+                    ),
                 },
-                environment: Environment(vec![
+                mouse: Mouse {
+                    off: false,
+                    natural_scroll: true,
+                    accel_speed: FloatOrInt(
+                        0.4,
+                    ),
+                    accel_profile: Some(
+                        Flat,
+                    ),
+                    scroll_method: Some(
+                        NoScroll,
+                    ),
+                    scroll_button: Some(
+                        273,
+                    ),
+                    scroll_button_lock: false,
+                    left_handed: false,
+                    middle_emulation: true,
+                    scroll_factor: Some(
+                        ScrollFactor {
+                            base: Some(
+                                FloatOrInt(
+                                    0.2,
+                                ),
+                            ),
+                            horizontal: None,
+                            vertical: None,
+                        },
+                    ),
+                },
+                trackpoint: Trackpoint {
+                    off: true,
+                    natural_scroll: true,
+                    accel_speed: FloatOrInt(
+                        0.0,
+                    ),
+                    accel_profile: Some(
+                        Flat,
+                    ),
+                    scroll_method: Some(
+                        OnButtonDown,
+                    ),
+                    scroll_button: Some(
+                        274,
+                    ),
+                    scroll_button_lock: false,
+                    left_handed: false,
+                    middle_emulation: false,
+                },
+                trackball: Trackball {
+                    off: true,
+                    natural_scroll: true,
+                    accel_speed: FloatOrInt(
+                        0.0,
+                    ),
+                    accel_profile: Some(
+                        Flat,
+                    ),
+                    scroll_method: Some(
+                        Edge,
+                    ),
+                    scroll_button: Some(
+                        275,
+                    ),
+                    scroll_button_lock: true,
+                    left_handed: true,
+                    middle_emulation: true,
+                },
+                tablet: Tablet {
+                    off: false,
+                    calibration_matrix: Some(
+                        [
+                            1.0,
+                            2.0,
+                            3.0,
+                            4.0,
+                            5.0,
+                            6.0,
+                        ],
+                    ),
+                    map_to_output: Some(
+                        "eDP-1",
+                    ),
+                    map_to_focused_output: true,
+                    map_to_focused_window: true,
+                    left_handed: false,
+                },
+                touch: Touch {
+                    off: false,
+                    calibration_matrix: None,
+                    map_to_output: Some(
+                        "eDP-1",
+                    ),
+                },
+                disable_power_key_handling: true,
+                warp_mouse_to_focus: Some(
+                    WarpMouseToFocus {
+                        mode: None,
+                    },
+                ),
+                focus_follows_mouse: Some(
+                    FocusFollowsMouse {
+                        max_scroll_amount: None,
+                    },
+                ),
+                workspace_auto_back_and_forth: true,
+                mod_key: Some(
+                    IsoLevel3Shift,
+                ),
+                mod_key_nested: Some(
+                    Super,
+                ),
+            },
+            outputs: Outputs(
+                [
+                    Output {
+                        off: false,
+                        name: "eDP-1",
+                        scale: Some(
+                            FloatOrInt(
+                                2.0,
+                            ),
+                        ),
+                        transform: Flipped90,
+                        position: Some(
+                            Position {
+                                x: 10,
+                                y: 20,
+                            },
+                        ),
+                        max_bpc: Some(
+                            MaxBpc(
+                                _10,
+                            ),
+                        ),
+                        mode: Some(
+                            Mode {
+                                custom: false,
+                                mode: ConfiguredMode {
+                                    width: 1920,
+                                    height: 1080,
+                                    refresh: Some(
+                                        144.0,
+                                    ),
+                                },
+                            },
+                        ),
+                        modeline: None,
+                        variable_refresh_rate: Some(
+                            Vrr {
+                                on_demand: true,
+                            },
+                        ),
+                        focus_at_startup: true,
+                        background_color: Some(
+                            Color {
+                                r: 0.09803922,
+                                g: 0.09803922,
+                                b: 0.4,
+                                a: 1.0,
+                            },
+                        ),
+                        backdrop_color: None,
+                        hot_corners: Some(
+                            HotCorners {
+                                off: true,
+                                top_left: true,
+                                top_right: true,
+                                bottom_left: true,
+                                bottom_right: true,
+                            },
+                        ),
+                        layout: None,
+                    },
+                    Output {
+                        off: false,
+                        name: "eDP-2",
+                        scale: None,
+                        transform: Normal,
+                        position: None,
+                        max_bpc: None,
+                        mode: Some(
+                            Mode {
+                                custom: true,
+                                mode: ConfiguredMode {
+                                    width: 1920,
+                                    height: 1080,
+                                    refresh: Some(
+                                        144.0,
+                                    ),
+                                },
+                            },
+                        ),
+                        modeline: None,
+                        variable_refresh_rate: None,
+                        focus_at_startup: false,
+                        background_color: None,
+                        backdrop_color: None,
+                        hot_corners: None,
+                        layout: None,
+                    },
+                    Output {
+                        off: false,
+                        name: "eDP-3",
+                        scale: None,
+                        transform: Normal,
+                        position: None,
+                        max_bpc: None,
+                        mode: None,
+                        modeline: Some(
+                            Modeline {
+                                clock: 173.0,
+                                hdisplay: 1920,
+                                hsync_start: 2048,
+                                hsync_end: 2248,
+                                htotal: 2576,
+                                vdisplay: 1080,
+                                vsync_start: 1083,
+                                vsync_end: 1088,
+                                vtotal: 1120,
+                                hsync_polarity: NHSync,
+                                vsync_polarity: PVSync,
+                            },
+                        ),
+                        variable_refresh_rate: None,
+                        focus_at_startup: false,
+                        background_color: None,
+                        backdrop_color: None,
+                        hot_corners: None,
+                        layout: None,
+                    },
+                ],
+            ),
+            spawn_at_startup: [
+                SpawnAtStartup {
+                    command: [
+                        "alacritty",
+                        "-e",
+                        "fish",
+                    ],
+                },
+            ],
+            spawn_sh_at_startup: [
+                SpawnShAtStartup {
+                    command: "qs -c ~/source/qs/MyAwesomeShell",
+                },
+            ],
+            layout: Layout {
+                focus_ring: FocusRing {
+                    off: false,
+                    width: 5.0,
+                    active_color: Color {
+                        r: 0.0,
+                        g: 0.39215687,
+                        b: 0.78431374,
+                        a: 1.0,
+                    },
+                    inactive_color: Color {
+                        r: 1.0,
+                        g: 0.78431374,
+                        b: 0.39215687,
+                        a: 0.0,
+                    },
+                    urgent_color: Color {
+                        r: 0.60784316,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    },
+                    active_gradient: Some(
+                        Gradient {
+                            from: Color {
+                                r: 0.039215688,
+                                g: 0.078431375,
+                                b: 0.11764706,
+                                a: 1.0,
+                            },
+                            to: Color {
+                                r: 0.0,
+                                g: 0.5019608,
+                                b: 1.0,
+                                a: 1.0,
+                            },
+                            angle: 180,
+                            relative_to: WorkspaceView,
+                            in_: GradientInterpolation {
+                                color_space: Srgb,
+                                hue_interpolation: Shorter,
+                            },
+                        },
+                    ),
+                    inactive_gradient: None,
+                    urgent_gradient: None,
+                },
+                border: Border {
+                    off: false,
+                    width: 3.0,
+                    active_color: Color {
+                        r: 1.0,
+                        g: 0.78431374,
+                        b: 0.49803922,
+                        a: 1.0,
+                    },
+                    inactive_color: Color {
+                        r: 1.0,
+                        g: 0.78431374,
+                        b: 0.39215687,
+                        a: 0.0,
+                    },
+                    urgent_color: Color {
+                        r: 0.60784316,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    },
+                    active_gradient: None,
+                    inactive_gradient: None,
+                    urgent_gradient: None,
+                },
+                shadow: Shadow {
+                    on: false,
+                    offset: ShadowOffset {
+                        x: FloatOrInt(
+                            10.0,
+                        ),
+                        y: FloatOrInt(
+                            -20.0,
+                        ),
+                    },
+                    softness: 30.0,
+                    spread: 5.0,
+                    draw_behind_window: false,
+                    color: Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.46666667,
+                    },
+                    inactive_color: None,
+                },
+                tab_indicator: TabIndicator {
+                    off: false,
+                    hide_when_single_tab: false,
+                    place_within_column: false,
+                    gap: 5.0,
+                    width: 10.0,
+                    length: TabIndicatorLength {
+                        total_proportion: Some(
+                            0.5,
+                        ),
+                    },
+                    position: Top,
+                    gaps_between_tabs: 0.0,
+                    corner_radius: 0.0,
+                    active_color: None,
+                    inactive_color: None,
+                    urgent_color: None,
+                    active_gradient: None,
+                    inactive_gradient: None,
+                    urgent_gradient: None,
+                },
+                insert_hint: InsertHint {
+                    off: false,
+                    color: Color {
+                        r: 1.0,
+                        g: 0.78431374,
+                        b: 0.49803922,
+                        a: 1.0,
+                    },
+                    gradient: Some(
+                        Gradient {
+                            from: Color {
+                                r: 0.039215688,
+                                g: 0.078431375,
+                                b: 0.11764706,
+                                a: 1.0,
+                            },
+                            to: Color {
+                                r: 0.0,
+                                g: 0.5019608,
+                                b: 1.0,
+                                a: 1.0,
+                            },
+                            angle: 180,
+                            relative_to: WorkspaceView,
+                            in_: GradientInterpolation {
+                                color_space: Srgb,
+                                hue_interpolation: Shorter,
+                            },
+                        },
+                    ),
+                },
+                preset_column_widths: [
+                    Proportion(
+                        0.25,
+                    ),
+                    Proportion(
+                        0.5,
+                    ),
+                    Fixed(
+                        960,
+                    ),
+                    Fixed(
+                        1280,
+                    ),
+                ],
+                default_column_width: Some(
+                    Proportion(
+                        0.25,
+                    ),
+                ),
+                preset_window_heights: [
+                    Proportion(
+                        0.25,
+                    ),
+                    Proportion(
+                        0.5,
+                    ),
+                    Fixed(
+                        960,
+                    ),
+                    Fixed(
+                        1280,
+                    ),
+                ],
+                center_focused_column: OnOverflow,
+                always_center_single_column: false,
+                empty_workspace_above_first: false,
+                default_column_display: Tabbed,
+                gaps: 8.0,
+                struts: Struts {
+                    left: FloatOrInt(
+                        1.0,
+                    ),
+                    right: FloatOrInt(
+                        2.0,
+                    ),
+                    top: FloatOrInt(
+                        3.0,
+                    ),
+                    bottom: FloatOrInt(
+                        0.0,
+                    ),
+                },
+                background_color: Color {
+                    r: 0.25,
+                    g: 0.25,
+                    b: 0.25,
+                    a: 1.0,
+                },
+            },
+            prefer_no_csd: true,
+            cursor: Cursor {
+                xcursor_theme: "breeze_cursors",
+                xcursor_size: 16,
+                hide_when_typing: true,
+                hide_after_inactive_ms: Some(
+                    3000,
+                ),
+            },
+            screenshot_path: ScreenshotPath(
+                Some(
+                    "~/Screenshots/screenshot.png",
+                ),
+            ),
+            clipboard: Clipboard {
+                disable_primary: true,
+            },
+            hotkey_overlay: HotkeyOverlay {
+                skip_at_startup: true,
+                hide_not_bound: false,
+            },
+            config_notification: ConfigNotification {
+                disable_failed: false,
+            },
+            animations: Animations {
+                off: false,
+                slowdown: 2.0,
+                workspace_switch: WorkspaceSwitchAnim(
+                    Animation {
+                        off: false,
+                        kind: Spring(
+                            SpringParams {
+                                damping_ratio: 1.0,
+                                stiffness: 1000,
+                                epsilon: 0.0001,
+                            },
+                        ),
+                    },
+                ),
+                window_open: WindowOpenAnim {
+                    anim: Animation {
+                        off: true,
+                        kind: Easing(
+                            EasingParams {
+                                duration_ms: 150,
+                                curve: EaseOutExpo,
+                            },
+                        ),
+                    },
+                    custom_shader: None,
+                },
+                window_close: WindowCloseAnim {
+                    anim: Animation {
+                        off: false,
+                        kind: Easing(
+                            EasingParams {
+                                duration_ms: 150,
+                                curve: CubicBezier(
+                                    0.05,
+                                    0.7,
+                                    0.1,
+                                    1.0,
+                                ),
+                            },
+                        ),
+                    },
+                    custom_shader: None,
+                },
+                horizontal_view_movement: HorizontalViewMovementAnim(
+                    Animation {
+                        off: false,
+                        kind: Easing(
+                            EasingParams {
+                                duration_ms: 100,
+                                curve: EaseOutExpo,
+                            },
+                        ),
+                    },
+                ),
+                window_movement: WindowMovementAnim(
+                    Animation {
+                        off: false,
+                        kind: Spring(
+                            SpringParams {
+                                damping_ratio: 1.0,
+                                stiffness: 800,
+                                epsilon: 0.0001,
+                            },
+                        ),
+                    },
+                ),
+                window_resize: WindowResizeAnim {
+                    anim: Animation {
+                        off: false,
+                        kind: Spring(
+                            SpringParams {
+                                damping_ratio: 1.0,
+                                stiffness: 800,
+                                epsilon: 0.0001,
+                            },
+                        ),
+                    },
+                    custom_shader: None,
+                },
+                config_notification_open_close: ConfigNotificationOpenCloseAnim(
+                    Animation {
+                        off: false,
+                        kind: Spring(
+                            SpringParams {
+                                damping_ratio: 0.6,
+                                stiffness: 1000,
+                                epsilon: 0.001,
+                            },
+                        ),
+                    },
+                ),
+                exit_confirmation_open_close: ExitConfirmationOpenCloseAnim(
+                    Animation {
+                        off: false,
+                        kind: Spring(
+                            SpringParams {
+                                damping_ratio: 0.6,
+                                stiffness: 500,
+                                epsilon: 0.01,
+                            },
+                        ),
+                    },
+                ),
+                screenshot_ui_open: ScreenshotUiOpenAnim(
+                    Animation {
+                        off: false,
+                        kind: Easing(
+                            EasingParams {
+                                duration_ms: 200,
+                                curve: EaseOutQuad,
+                            },
+                        ),
+                    },
+                ),
+                overview_open_close: OverviewOpenCloseAnim(
+                    Animation {
+                        off: false,
+                        kind: Spring(
+                            SpringParams {
+                                damping_ratio: 1.0,
+                                stiffness: 800,
+                                epsilon: 0.0001,
+                            },
+                        ),
+                    },
+                ),
+                recent_windows_close: RecentWindowsCloseAnim(
+                    Animation {
+                        off: true,
+                        kind: Spring(
+                            SpringParams {
+                                damping_ratio: 1.0,
+                                stiffness: 800,
+                                epsilon: 0.001,
+                            },
+                        ),
+                    },
+                ),
+            },
+            blur: Blur {
+                off: false,
+                passes: 3,
+                offset: 3.0,
+                noise: 0.02,
+                saturation: 1.5,
+            },
+            gestures: Gestures {
+                dnd_edge_view_scroll: DndEdgeViewScroll {
+                    trigger_width: 10.0,
+                    delay_ms: 100,
+                    max_speed: 50.0,
+                },
+                dnd_edge_workspace_switch: DndEdgeWorkspaceSwitch {
+                    trigger_height: 50.0,
+                    delay_ms: 100,
+                    max_speed: 1500.0,
+                },
+                hot_corners: HotCorners {
+                    off: false,
+                    top_left: false,
+                    top_right: false,
+                    bottom_left: false,
+                    bottom_right: false,
+                },
+            },
+            overview: Overview {
+                zoom: 0.5,
+                backdrop_color: Color {
+                    r: 0.15,
+                    g: 0.15,
+                    b: 0.15,
+                    a: 1.0,
+                },
+                workspace_shadow: WorkspaceShadow {
+                    off: false,
+                    offset: ShadowOffset {
+                        x: FloatOrInt(
+                            0.0,
+                        ),
+                        y: FloatOrInt(
+                            10.0,
+                        ),
+                    },
+                    softness: 40.0,
+                    spread: 10.0,
+                    color: Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.3137255,
+                    },
+                },
+            },
+            environment: Environment(
+                [
                     EnvironmentVariable {
-                        name: String::from("QT_QPA_PLATFORM"),
-                        value: Some(String::from("wayland")),
+                        name: "QT_QPA_PLATFORM",
+                        value: Some(
+                            "wayland",
+                        ),
                     },
                     EnvironmentVariable {
-                        name: String::from("DISPLAY"),
+                        name: "DISPLAY",
                         value: None,
                     },
-                ]),
-                window_rules: vec![WindowRule {
-                    matches: vec![Match {
-                        app_id: Some(Regex::new(".*alacritty").unwrap()),
-                        title: None,
-                        is_active: None,
-                        is_focused: None,
-                        is_active_in_column: None,
-                        at_startup: None,
-                    }],
-                    excludes: vec![
+                ],
+            ),
+            xwayland_satellite: XwaylandSatellite {
+                off: false,
+                path: "xwayland-satellite",
+            },
+            window_rules: [
+                WindowRule {
+                    matches: [
                         Match {
-                            app_id: None,
-                            title: Some(Regex::new("~").unwrap()),
+                            app_id: Some(
+                                RegexEq(
+                                    Regex(
+                                        ".*alacritty",
+                                    ),
+                                ),
+                            ),
+                            title: None,
                             is_active: None,
                             is_focused: None,
                             is_active_in_column: None,
+                            is_floating: None,
+                            is_window_cast_target: None,
+                            is_urgent: None,
+                            at_startup: None,
+                        },
+                    ],
+                    excludes: [
+                        Match {
+                            app_id: None,
+                            title: Some(
+                                RegexEq(
+                                    Regex(
+                                        "~",
+                                    ),
+                                ),
+                            ),
+                            is_active: None,
+                            is_focused: None,
+                            is_active_in_column: None,
+                            is_floating: None,
+                            is_window_cast_target: None,
+                            is_urgent: None,
                             at_startup: None,
                         },
                         Match {
                             app_id: None,
                             title: None,
-                            is_active: Some(true),
-                            is_focused: Some(false),
+                            is_active: Some(
+                                true,
+                            ),
+                            is_focused: Some(
+                                false,
+                            ),
                             is_active_in_column: None,
+                            is_floating: None,
+                            is_window_cast_target: None,
+                            is_urgent: None,
                             at_startup: None,
                         },
                     ],
-                    open_on_output: Some("eDP-1".to_owned()),
-                    open_maximized: Some(true),
-                    open_fullscreen: Some(false),
+                    default_column_width: None,
+                    default_window_height: Some(
+                        DefaultPresetSize(
+                            Some(
+                                Fixed(
+                                    500,
+                                ),
+                            ),
+                        ),
+                    ),
+                    open_on_output: Some(
+                        "eDP-1",
+                    ),
+                    open_on_workspace: None,
+                    open_maximized: Some(
+                        true,
+                    ),
+                    open_maximized_to_edges: None,
+                    open_fullscreen: Some(
+                        false,
+                    ),
+                    open_floating: Some(
+                        false,
+                    ),
+                    open_focused: Some(
+                        true,
+                    ),
+                    on_xdg_activate: Some(
+                        Ignore,
+                    ),
+                    min_width: None,
+                    min_height: None,
+                    max_width: None,
+                    max_height: None,
                     focus_ring: BorderRule {
                         off: true,
-                        width: Some(FloatOrInt(3.)),
-                        ..Default::default()
+                        on: false,
+                        width: Some(
+                            FloatOrInt(
+                                3.0,
+                            ),
+                        ),
+                        active_color: None,
+                        inactive_color: None,
+                        urgent_color: None,
+                        active_gradient: None,
+                        inactive_gradient: None,
+                        urgent_gradient: None,
                     },
                     border: BorderRule {
+                        off: false,
                         on: true,
-                        width: Some(FloatOrInt(8.5)),
-                        ..Default::default()
+                        width: Some(
+                            FloatOrInt(
+                                8.5,
+                            ),
+                        ),
+                        active_color: None,
+                        inactive_color: None,
+                        urgent_color: None,
+                        active_gradient: None,
+                        inactive_gradient: None,
+                        urgent_gradient: None,
                     },
-                    ..Default::default()
-                }],
-                workspaces: vec![
-                    Workspace {
-                        name: WorkspaceName("workspace-1".to_string()),
-                        open_on_output: Some("eDP-1".to_string()),
+                    shadow: ShadowRule {
+                        off: false,
+                        on: false,
+                        offset: None,
+                        softness: None,
+                        spread: None,
+                        draw_behind_window: None,
+                        color: None,
+                        inactive_color: None,
                     },
-                    Workspace {
-                        name: WorkspaceName("workspace-2".to_string()),
-                        open_on_output: None,
+                    tab_indicator: TabIndicatorRule {
+                        active_color: Some(
+                            Color {
+                                r: 1.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 1.0,
+                            },
+                        ),
+                        inactive_color: None,
+                        urgent_color: None,
+                        active_gradient: None,
+                        inactive_gradient: None,
+                        urgent_gradient: None,
                     },
-                    Workspace {
-                        name: WorkspaceName("workspace-3".to_string()),
-                        open_on_output: None,
+                    draw_border_with_background: None,
+                    opacity: None,
+                    geometry_corner_radius: None,
+                    clip_to_geometry: None,
+                    baba_is_float: None,
+                    block_out_from: None,
+                    variable_refresh_rate: None,
+                    default_column_display: Some(
+                        Tabbed,
+                    ),
+                    default_floating_position: Some(
+                        FloatingPosition {
+                            x: FloatOrInt(
+                                100.0,
+                            ),
+                            y: FloatOrInt(
+                                -200.0,
+                            ),
+                            relative_to: BottomLeft,
+                        },
+                    ),
+                    scroll_factor: None,
+                    tiled_state: None,
+                    background_effect: BackgroundEffectRule {
+                        xray: None,
+                        blur: None,
+                        noise: None,
+                        saturation: None,
                     },
-                ],
-                binds: Binds(vec![
+                    popups: PopupsRule {
+                        opacity: None,
+                        geometry_corner_radius: None,
+                        background_effect: BackgroundEffectRule {
+                            xray: None,
+                            blur: None,
+                            noise: None,
+                            saturation: None,
+                        },
+                    },
+                },
+            ],
+            layer_rules: [
+                LayerRule {
+                    matches: [
+                        Match {
+                            namespace: Some(
+                                RegexEq(
+                                    Regex(
+                                        "^notifications$",
+                                    ),
+                                ),
+                            ),
+                            at_startup: None,
+                            layer: None,
+                        },
+                    ],
+                    excludes: [],
+                    opacity: None,
+                    block_out_from: Some(
+                        Screencast,
+                    ),
+                    shadow: ShadowRule {
+                        off: false,
+                        on: false,
+                        offset: None,
+                        softness: None,
+                        spread: None,
+                        draw_behind_window: None,
+                        color: None,
+                        inactive_color: None,
+                    },
+                    geometry_corner_radius: None,
+                    place_within_backdrop: None,
+                    baba_is_float: None,
+                    background_effect: BackgroundEffectRule {
+                        xray: None,
+                        blur: None,
+                        noise: None,
+                        saturation: None,
+                    },
+                    popups: PopupsRule {
+                        opacity: None,
+                        geometry_corner_radius: None,
+                        background_effect: BackgroundEffectRule {
+                            xray: None,
+                            blur: None,
+                            noise: None,
+                            saturation: None,
+                        },
+                    },
+                },
+            ],
+            binds: Binds(
+                [
                     Bind {
                         key: Key {
-                            trigger: Trigger::Keysym(Keysym::t),
-                            modifiers: Modifiers::COMPOSITOR,
+                            trigger: Keysym(
+                                XK_Escape,
+                            ),
+                            modifiers: Modifiers(
+                                COMPOSITOR,
+                            ),
                         },
-                        action: Action::Spawn(vec!["alacritty".to_owned()]),
+                        action: ToggleKeyboardShortcutsInhibit,
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
+                        hotkey_overlay_title: Some(
+                            Some(
+                                "Inhibit",
+                            ),
+                        ),
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_Escape,
+                            ),
+                            modifiers: Modifiers(
+                                SHIFT | COMPOSITOR,
+                            ),
+                        },
+                        action: ToggleKeyboardShortcutsInhibit,
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_t,
+                            ),
+                            modifiers: Modifiers(
+                                COMPOSITOR,
+                            ),
+                        },
+                        action: Spawn(
+                            [
+                                "alacritty",
+                            ],
+                        ),
                         repeat: true,
                         cooldown: None,
                         allow_when_locked: true,
+                        allow_inhibiting: true,
+                        hotkey_overlay_title: None,
                     },
                     Bind {
                         key: Key {
-                            trigger: Trigger::Keysym(Keysym::q),
-                            modifiers: Modifiers::COMPOSITOR,
+                            trigger: Keysym(
+                                XK_q,
+                            ),
+                            modifiers: Modifiers(
+                                COMPOSITOR,
+                            ),
                         },
-                        action: Action::CloseWindow,
+                        action: CloseWindow,
                         repeat: true,
                         cooldown: None,
                         allow_when_locked: false,
+                        allow_inhibiting: true,
+                        hotkey_overlay_title: Some(
+                            None,
+                        ),
                     },
                     Bind {
                         key: Key {
-                            trigger: Trigger::Keysym(Keysym::h),
-                            modifiers: Modifiers::COMPOSITOR | Modifiers::SHIFT,
+                            trigger: Keysym(
+                                XK_h,
+                            ),
+                            modifiers: Modifiers(
+                                SHIFT | COMPOSITOR,
+                            ),
                         },
-                        action: Action::FocusMonitorLeft,
+                        action: FocusMonitorLeft,
                         repeat: true,
                         cooldown: None,
                         allow_when_locked: false,
+                        allow_inhibiting: true,
+                        hotkey_overlay_title: None,
                     },
                     Bind {
                         key: Key {
-                            trigger: Trigger::Keysym(Keysym::l),
-                            modifiers: Modifiers::COMPOSITOR | Modifiers::SHIFT | Modifiers::CTRL,
+                            trigger: Keysym(
+                                XK_o,
+                            ),
+                            modifiers: Modifiers(
+                                SHIFT | COMPOSITOR,
+                            ),
                         },
-                        action: Action::MoveWindowToMonitorRight,
+                        action: FocusMonitor(
+                            "eDP-1",
+                        ),
                         repeat: true,
                         cooldown: None,
                         allow_when_locked: false,
+                        allow_inhibiting: true,
+                        hotkey_overlay_title: None,
                     },
                     Bind {
                         key: Key {
-                            trigger: Trigger::Keysym(Keysym::comma),
-                            modifiers: Modifiers::COMPOSITOR,
+                            trigger: Keysym(
+                                XK_l,
+                            ),
+                            modifiers: Modifiers(
+                                CTRL | SHIFT | COMPOSITOR,
+                            ),
                         },
-                        action: Action::ConsumeWindowIntoColumn,
+                        action: MoveWindowToMonitorRight,
                         repeat: true,
                         cooldown: None,
                         allow_when_locked: false,
+                        allow_inhibiting: true,
+                        hotkey_overlay_title: None,
                     },
                     Bind {
                         key: Key {
-                            trigger: Trigger::Keysym(Keysym::_1),
-                            modifiers: Modifiers::COMPOSITOR,
+                            trigger: Keysym(
+                                XK_o,
+                            ),
+                            modifiers: Modifiers(
+                                CTRL | ALT | COMPOSITOR,
+                            ),
                         },
-                        action: Action::FocusWorkspace(WorkspaceReference::Index(1)),
+                        action: MoveWindowToMonitor(
+                            "eDP-1",
+                        ),
                         repeat: true,
                         cooldown: None,
                         allow_when_locked: false,
+                        allow_inhibiting: true,
+                        hotkey_overlay_title: None,
                     },
                     Bind {
                         key: Key {
-                            trigger: Trigger::Keysym(Keysym::_1),
-                            modifiers: Modifiers::COMPOSITOR | Modifiers::SHIFT,
+                            trigger: Keysym(
+                                XK_p,
+                            ),
+                            modifiers: Modifiers(
+                                CTRL | ALT | COMPOSITOR,
+                            ),
                         },
-                        action: Action::FocusWorkspace(WorkspaceReference::Name(
-                            "workspace-1".to_string(),
-                        )),
+                        action: MoveColumnToMonitor(
+                            "DP-1",
+                        ),
                         repeat: true,
                         cooldown: None,
                         allow_when_locked: false,
+                        allow_inhibiting: true,
+                        hotkey_overlay_title: None,
                     },
                     Bind {
                         key: Key {
-                            trigger: Trigger::Keysym(Keysym::e),
-                            modifiers: Modifiers::COMPOSITOR | Modifiers::SHIFT,
+                            trigger: Keysym(
+                                XK_comma,
+                            ),
+                            modifiers: Modifiers(
+                                COMPOSITOR,
+                            ),
                         },
-                        action: Action::Quit(true),
+                        action: ConsumeWindowIntoColumn,
                         repeat: true,
                         cooldown: None,
                         allow_when_locked: false,
+                        allow_inhibiting: true,
+                        hotkey_overlay_title: None,
                     },
                     Bind {
                         key: Key {
-                            trigger: Trigger::WheelScrollDown,
-                            modifiers: Modifiers::COMPOSITOR,
+                            trigger: Keysym(
+                                XK_1,
+                            ),
+                            modifiers: Modifiers(
+                                COMPOSITOR,
+                            ),
                         },
-                        action: Action::FocusWorkspaceDown,
+                        action: FocusWorkspace(
+                            Index(
+                                1,
+                            ),
+                        ),
                         repeat: true,
-                        cooldown: Some(Duration::from_millis(150)),
+                        cooldown: None,
                         allow_when_locked: false,
+                        allow_inhibiting: true,
+                        hotkey_overlay_title: None,
                     },
-                ]),
-                debug: DebugConfig {
-                    render_drm_device: Some(PathBuf::from("/dev/dri/renderD129")),
-                    ..Default::default()
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_1,
+                            ),
+                            modifiers: Modifiers(
+                                SHIFT | COMPOSITOR,
+                            ),
+                        },
+                        action: FocusWorkspace(
+                            Name(
+                                "workspace-1",
+                            ),
+                        ),
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: true,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_e,
+                            ),
+                            modifiers: Modifiers(
+                                SHIFT | COMPOSITOR,
+                            ),
+                        },
+                        action: Quit(
+                            true,
+                        ),
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: WheelScrollDown,
+                            modifiers: Modifiers(
+                                COMPOSITOR,
+                            ),
+                        },
+                        action: FocusWorkspaceDown,
+                        repeat: true,
+                        cooldown: Some(
+                            150ms,
+                        ),
+                        allow_when_locked: false,
+                        allow_inhibiting: true,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_s,
+                            ),
+                            modifiers: Modifiers(
+                                ALT | SUPER,
+                            ),
+                        },
+                        action: SpawnSh(
+                            "pkill orca || exec orca",
+                        ),
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: true,
+                        allow_inhibiting: true,
+                        hotkey_overlay_title: None,
+                    },
+                ],
+            ),
+            switch_events: SwitchBinds {
+                lid_open: None,
+                lid_close: None,
+                tablet_mode_on: Some(
+                    SwitchAction {
+                        spawn: [
+                            "bash",
+                            "-c",
+                            "gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled true",
+                        ],
+                    },
+                ),
+                tablet_mode_off: Some(
+                    SwitchAction {
+                        spawn: [
+                            "bash",
+                            "-c",
+                            "gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled false",
+                        ],
+                    },
+                ),
+            },
+            debug: Debug {
+                preview_render: None,
+                dbus_interfaces_in_non_session_instances: false,
+                wait_for_frame_completion_before_queueing: false,
+                enable_overlay_planes: false,
+                disable_cursor_plane: false,
+                disable_direct_scanout: false,
+                restrict_primary_scanout_to_matching_format: false,
+                force_disable_connectors_on_resume: false,
+                render_drm_device: Some(
+                    "/dev/dri/renderD129",
+                ),
+                ignored_drm_devices: [
+                    "/dev/dri/renderD128",
+                    "/dev/dri/renderD130",
+                ],
+                force_pipewire_invalid_modifier: false,
+                disable_pipewire_dmabuf: false,
+                emulate_zero_presentation_time: false,
+                disable_resize_throttling: false,
+                disable_transactions: false,
+                keep_laptop_panel_on_when_lid_is_closed: false,
+                disable_monitor_names: false,
+                strict_new_window_focus_policy: false,
+                honor_xdg_activation_with_invalid_serial: false,
+                deactivate_unfocused_windows: false,
+                skip_cursor_only_updates_during_vrr: false,
+                disable_10bit_output: false,
+            },
+            workspaces: [
+                Workspace {
+                    name: WorkspaceName(
+                        "workspace-1",
+                    ),
+                    open_on_output: Some(
+                        "eDP-1",
+                    ),
+                    layout: None,
                 },
+                Workspace {
+                    name: WorkspaceName(
+                        "workspace-2",
+                    ),
+                    open_on_output: None,
+                    layout: None,
+                },
+                Workspace {
+                    name: WorkspaceName(
+                        "workspace-3",
+                    ),
+                    open_on_output: None,
+                    layout: None,
+                },
+            ],
+            recent_windows: RecentWindows {
+                on: false,
+                debounce_ms: 750,
+                open_delay_ms: 150,
+                highlight: MruHighlight {
+                    active_color: Color {
+                        r: 0.0,
+                        g: 1.0,
+                        b: 0.0,
+                        a: 1.0,
+                    },
+                    urgent_color: Color {
+                        r: 1.0,
+                        g: 0.6,
+                        b: 0.6,
+                        a: 1.0,
+                    },
+                    padding: 15.0,
+                    corner_radius: 0.0,
+                },
+                previews: MruPreviews {
+                    max_height: 960.0,
+                    max_scale: 0.5,
+                },
+                binds: [
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_Tab,
+                            ),
+                            modifiers: Modifiers(
+                                ALT,
+                            ),
+                        },
+                        action: MruAdvance {
+                            direction: Forward,
+                            scope: None,
+                            filter: Some(
+                                All,
+                            ),
+                        },
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: true,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_grave,
+                            ),
+                            modifiers: Modifiers(
+                                ALT,
+                            ),
+                        },
+                        action: MruAdvance {
+                            direction: Forward,
+                            scope: None,
+                            filter: Some(
+                                AppId,
+                            ),
+                        },
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: true,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_Tab,
+                            ),
+                            modifiers: Modifiers(
+                                SUPER,
+                            ),
+                        },
+                        action: MruAdvance {
+                            direction: Forward,
+                            scope: Some(
+                                Output,
+                            ),
+                            filter: Some(
+                                All,
+                            ),
+                        },
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: true,
+                        hotkey_overlay_title: None,
+                    },
+                ],
             },
-        );
+        }
+        "#);
+    }
+
+    fn diff_lines(expected: &str, actual: &str) -> String {
+        let mut output = String::new();
+        let mut in_change = false;
+
+        for change in diff::lines(expected, actual) {
+            match change {
+                diff::Result::Both(_, _) => {
+                    in_change = false;
+                }
+                diff::Result::Left(line) => {
+                    if !output.is_empty() && !in_change {
+                        output.push('\n');
+                    }
+                    output.push('-');
+                    output.push_str(line);
+                    output.push('\n');
+                    in_change = true;
+                }
+                diff::Result::Right(line) => {
+                    if !output.is_empty() && !in_change {
+                        output.push('\n');
+                    }
+                    output.push('+');
+                    output.push_str(line);
+                    output.push('\n');
+                    in_change = true;
+                }
+            }
+        }
+
+        output
     }
 
     #[test]
-    fn can_create_default_config() {
-        let _ = Config::default();
-    }
+    fn diff_empty_to_default() {
+        // We try to write the config defaults in such a way that empty sections (and an empty
+        // config) give the same outcome as the default config bundled with niri. This test
+        // verifies the actual differences between the two.
+        let mut default_config = Config::load_default();
+        let empty_config = Config::parse_mem("").unwrap();
 
-    #[test]
-    fn parse_mode() {
-        assert_eq!(
-            "2560x1600@165.004".parse::<ConfiguredMode>().unwrap(),
-            ConfiguredMode {
-                width: 2560,
-                height: 1600,
-                refresh: Some(165.004),
-            },
-        );
+        // Some notable omissions: the default config has some window rules, and an empty config
+        // will not have any binds. Clear them out so they don't spam the diff.
+        default_config.window_rules.clear();
+        default_config.binds.0.clear();
 
-        assert_eq!(
-            "1920x1080".parse::<ConfiguredMode>().unwrap(),
-            ConfiguredMode {
-                width: 1920,
-                height: 1080,
-                refresh: None,
-            },
-        );
+        assert_snapshot!(
+            diff_lines(
+                &format!("{empty_config:#?}"),
+                &format!("{default_config:#?}")
+            ),
+            @r#"
+        -            numlock: false,
+        +            numlock: true,
 
-        assert!("1920".parse::<ConfiguredMode>().is_err());
-        assert!("1920x".parse::<ConfiguredMode>().is_err());
-        assert!("1920x1080@".parse::<ConfiguredMode>().is_err());
-        assert!("1920x1080@60Hz".parse::<ConfiguredMode>().is_err());
-    }
+        -            tap: false,
+        +            tap: true,
 
-    #[test]
-    fn parse_size_change() {
-        assert_eq!(
-            "10".parse::<SizeChange>().unwrap(),
-            SizeChange::SetFixed(10),
-        );
-        assert_eq!(
-            "+10".parse::<SizeChange>().unwrap(),
-            SizeChange::AdjustFixed(10),
-        );
-        assert_eq!(
-            "-10".parse::<SizeChange>().unwrap(),
-            SizeChange::AdjustFixed(-10),
-        );
-        assert_eq!(
-            "10%".parse::<SizeChange>().unwrap(),
-            SizeChange::SetProportion(10.),
-        );
-        assert_eq!(
-            "+10%".parse::<SizeChange>().unwrap(),
-            SizeChange::AdjustProportion(10.),
-        );
-        assert_eq!(
-            "-10%".parse::<SizeChange>().unwrap(),
-            SizeChange::AdjustProportion(-10.),
-        );
+        -            natural_scroll: false,
+        +            natural_scroll: true,
 
-        assert!("-".parse::<SizeChange>().is_err());
-        assert!("10% ".parse::<SizeChange>().is_err());
-    }
+        -    spawn_at_startup: [],
+        +    spawn_at_startup: [
+        +        SpawnAtStartup {
+        +            command: [
+        +                "waybar",
+        +            ],
+        +        },
+        +    ],
 
-    #[test]
-    fn parse_gradient_interpolation() {
-        assert_eq!(
-            "srgb".parse::<GradientInterpolation>().unwrap(),
-            GradientInterpolation {
-                color_space: GradientColorSpace::Srgb,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            "srgb-linear".parse::<GradientInterpolation>().unwrap(),
-            GradientInterpolation {
-                color_space: GradientColorSpace::SrgbLinear,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            "oklab".parse::<GradientInterpolation>().unwrap(),
-            GradientInterpolation {
-                color_space: GradientColorSpace::Oklab,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            "oklch".parse::<GradientInterpolation>().unwrap(),
-            GradientInterpolation {
-                color_space: GradientColorSpace::Oklch,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            "oklch shorter hue"
-                .parse::<GradientInterpolation>()
-                .unwrap(),
-            GradientInterpolation {
-                color_space: GradientColorSpace::Oklch,
-                hue_interpolation: HueInterpolation::Shorter,
-            }
-        );
-        assert_eq!(
-            "oklch longer hue".parse::<GradientInterpolation>().unwrap(),
-            GradientInterpolation {
-                color_space: GradientColorSpace::Oklch,
-                hue_interpolation: HueInterpolation::Longer,
-            }
-        );
-        assert_eq!(
-            "oklch decreasing hue"
-                .parse::<GradientInterpolation>()
-                .unwrap(),
-            GradientInterpolation {
-                color_space: GradientColorSpace::Oklch,
-                hue_interpolation: HueInterpolation::Decreasing,
-            }
-        );
-        assert_eq!(
-            "oklch increasing hue"
-                .parse::<GradientInterpolation>()
-                .unwrap(),
-            GradientInterpolation {
-                color_space: GradientColorSpace::Oklch,
-                hue_interpolation: HueInterpolation::Increasing,
-            }
-        );
+        -                0.3333333333333333,
+        +                0.33333,
 
-        assert!("".parse::<GradientInterpolation>().is_err());
-        assert!("srgb shorter hue".parse::<GradientInterpolation>().is_err());
-        assert!("oklch shorter".parse::<GradientInterpolation>().is_err());
-        assert!("oklch shorter h".parse::<GradientInterpolation>().is_err());
-        assert!("oklch a hue".parse::<GradientInterpolation>().is_err());
-        assert!("oklch shorter hue a"
-            .parse::<GradientInterpolation>()
-            .is_err());
-    }
-
-    #[test]
-    fn parse_iso_level3_shift() {
-        assert_eq!(
-            "ISO_Level3_Shift+A".parse::<Key>().unwrap(),
-            Key {
-                trigger: Trigger::Keysym(Keysym::a),
-                modifiers: Modifiers::ISO_LEVEL3_SHIFT
-            },
+        -                0.6666666666666666,
+        +                0.66667,
+        "#,
         );
-        assert_eq!(
-            "Mod5+A".parse::<Key>().unwrap(),
-            Key {
-                trigger: Trigger::Keysym(Keysym::a),
-                modifiers: Modifiers::ISO_LEVEL3_SHIFT
-            },
-        );
-    }
-
-    #[test]
-    fn default_repeat_params() {
-        let config = Config::parse("config.kdl", "").unwrap();
-        assert_eq!(config.input.keyboard.repeat_delay, 600);
-        assert_eq!(config.input.keyboard.repeat_rate, 25);
     }
 }

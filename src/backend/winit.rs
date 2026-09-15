@@ -3,10 +3,12 @@ use std::collections::HashMap;
 use std::mem;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use niri_config::Config;
+use anyhow::Context as _;
+use niri_config::{Config, OutputName};
 use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::drm::DrmNode;
+use smithay::backend::egl::EGLDevice;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::{DebugFlags, ImportDma, ImportEgl, Renderer};
@@ -15,12 +17,15 @@ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::reexports::winit::dpi::LogicalSize;
-use smithay::reexports::winit::window::Window;
+use smithay::reexports::winit::platform::wayland::WindowAttributesWayland;
+use smithay::reexports::winit::window::WindowAttributes;
+use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal};
+use smithay::wayland::presentation::Refresh;
 
 use super::{IpcOutputMap, OutputId, RenderResult};
 use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
-use crate::render_helpers::{resources, shaders, RenderTarget};
+use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, logical_output};
 
 pub struct Winit {
@@ -28,6 +33,10 @@ pub struct Winit {
     output: Output,
     backend: WinitGraphicsBackend<GlesRenderer>,
     damage_tracker: OutputDamageTracker,
+    render_node: Option<DrmNode>,
+    dmabuf_global: Option<DmabufGlobal>,
+    #[cfg(feature = "xdp-gnome-screencast")]
+    gbm_device: Option<smithay::backend::allocator::gbm::GbmDevice<smithay::utils::DeviceFd>>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
 }
 
@@ -36,10 +45,15 @@ impl Winit {
         config: Rc<RefCell<Config>>,
         event_loop: LoopHandle<State>,
     ) -> Result<Self, winit::Error> {
-        let builder = Window::default_attributes()
-            .with_inner_size(LogicalSize::new(1280.0, 800.0))
+        let _span = tracy_client::span!("Winit::new");
+
+        let builder = WindowAttributes::default()
+            .with_surface_size(LogicalSize::new(1280.0, 800.0))
             // .with_resizable(false)
-            .with_title("niri");
+            .with_title("niri")
+            .with_platform_attributes(Box::new(
+                WindowAttributesWayland::default().with_name("niri", ""),
+            ));
         let (backend, winit) = winit::init_from_attributes(builder)?;
 
         let output = Output::new(
@@ -49,6 +63,7 @@ impl Winit {
                 subpixel: Subpixel::Unknown,
                 make: "Smithay".into(),
                 model: "Winit".into(),
+                serial_number: "Unknown".into(),
             },
         );
 
@@ -59,6 +74,13 @@ impl Winit {
         output.change_current_state(Some(mode), None, None, None);
         output.set_preferred(mode);
 
+        output.user_data().insert_if_missing(|| OutputName {
+            connector: "winit".to_string(),
+            make: Some("Smithay".to_string()),
+            model: Some("Winit".to_string()),
+            serial: None,
+        });
+
         let physical_properties = output.physical_properties();
         let ipc_outputs = Arc::new(Mutex::new(HashMap::from([(
             OutputId::next(),
@@ -66,6 +88,7 @@ impl Winit {
                 name: output.name(),
                 make: physical_properties.make,
                 model: physical_properties.model,
+                serial: None,
                 physical_size: None,
                 modes: vec![niri_ipc::Mode {
                     width: backend.window_size().w.clamp(0, u16::MAX as i32) as u16,
@@ -74,9 +97,11 @@ impl Winit {
                     is_preferred: true,
                 }],
                 current_mode: Some(0),
+                is_custom_mode: true,
                 vrr_supported: false,
                 vrr_enabled: false,
                 logical: Some(logical_output(&output)),
+                max_bpc: None,
             },
         )])));
 
@@ -123,6 +148,10 @@ impl Winit {
             output,
             backend,
             damage_tracker,
+            render_node: None,
+            dmabuf_global: None,
+            #[cfg(feature = "xdp-gnome-screencast")]
+            gbm_device: None,
             ipc_outputs,
         })
     }
@@ -130,7 +159,10 @@ impl Winit {
     pub fn init(&mut self, niri: &mut Niri) {
         let renderer = self.backend.renderer();
         if let Err(err) = renderer.bind_wl_display(&niri.display_handle) {
-            warn!("error binding renderer wl_display: {err}");
+            // wl_drm is on its way out so this is expected on most modern distros.
+            trace!("error binding legacy EGL to wl_display: {err}");
+        } else {
+            debug!("bound legacy EGL to wl_display");
         }
 
         resources::init(renderer);
@@ -148,9 +180,103 @@ impl Winit {
         }
         drop(config);
 
-        niri.layout.update_shaders();
+        niri.update_shaders();
+
+        // Winit creates a single EGL display, so its render node cannot change.
+        self.render_node = match self.fetch_render_node() {
+            Ok(node) => {
+                if let Some(path) = node.dev_path() {
+                    debug!("using as the render node: {path:?}");
+                } else {
+                    debug!("using as the render node: {node}");
+                }
+
+                Some(node)
+            }
+            Err(err) => {
+                debug!("failed querying render node: {err:?}");
+                None
+            }
+        };
+
+        self.create_dmabuf_global(niri);
+
+        #[cfg(feature = "xdp-gnome-screencast")]
+        if let Err(err) = self.create_gbm_device() {
+            debug!("couldn't create GBM device for screencasting: {err:?}");
+        };
 
         niri.add_output(self.output.clone(), None, false);
+    }
+
+    fn fetch_render_node(&mut self) -> anyhow::Result<DrmNode> {
+        let display = self.backend.renderer().egl_context().display();
+        EGLDevice::device_for_display(display)
+            .context("error getting EGL device")?
+            .try_get_render_node()
+            .context("error getting EGL device render node")?
+            .context("failed to query EGL device render node")
+    }
+
+    pub fn create_dmabuf_global(&mut self, niri: &mut Niri) {
+        let renderer = self.backend.renderer();
+
+        let default_feedback = || {
+            let node = self
+                .render_node
+                .as_ref()
+                .context("no render node available")?;
+            let primary_formats = renderer.dmabuf_formats();
+            DmabufFeedbackBuilder::new(node.dev_id(), primary_formats)
+                .build()
+                .context("error building dmabuf feedback")
+        };
+
+        // Fallback to dmabuf v3 if we failed to build feedback.
+        let dmabuf_global = match default_feedback() {
+            Ok(feedback) => niri
+                .dmabuf_state
+                .create_global_with_default_feedback::<State>(&niri.display_handle, &feedback),
+            Err(err) => {
+                debug!("failed building default dmabuf feedback, falling back to v3: {err:?}");
+                let primary_formats = renderer.dmabuf_formats();
+                niri.dmabuf_state
+                    .create_global::<State>(&niri.display_handle, primary_formats)
+            }
+        };
+        assert!(self.dmabuf_global.replace(dmabuf_global).is_none());
+    }
+
+    #[cfg(feature = "xdp-gnome-screencast")]
+    fn create_gbm_device(&mut self) -> anyhow::Result<()> {
+        use std::os::fd::OwnedFd;
+
+        use smithay::backend::allocator::gbm::GbmDevice;
+        use smithay::utils::DeviceFd;
+
+        let node = self
+            .render_node
+            .as_ref()
+            .context("no render node available")?;
+        let path = node.dev_path().context("render node has no device path")?;
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(path)
+            .context("error opening render node")?;
+
+        let gbm_device = GbmDevice::new(DeviceFd::from(OwnedFd::from(file)))
+            .context("error creating GBM device")?;
+
+        self.gbm_device = Some(gbm_device);
+        Ok(())
+    }
+
+    #[cfg(feature = "xdp-gnome-screencast")]
+    pub fn gbm_device(
+        &self,
+    ) -> Option<smithay::backend::allocator::gbm::GbmDevice<smithay::utils::DeviceFd>> {
+        self.gbm_device.clone()
     }
 
     pub fn seat_name(&self) -> String {
@@ -164,16 +290,20 @@ impl Winit {
         Some(f(self.backend.renderer()))
     }
 
+    pub fn primary_render_node(&mut self) -> Option<DrmNode> {
+        self.render_node
+    }
+
     pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
         let _span = tracy_client::span!("Winit::render");
 
         // Render the elements.
-        let mut elements = niri.render::<GlesRenderer>(
-            self.backend.renderer(),
-            output,
-            true,
-            RenderTarget::Output,
-        );
+        let ctx = RenderCtx {
+            renderer: self.backend.renderer(),
+            target: RenderTarget::Output,
+            xray: None,
+        };
+        let mut elements = niri.render_to_vec(ctx, output, true);
 
         // Visualize the damage, if enabled.
         if niri.debug_draw_damage {
@@ -182,12 +312,16 @@ impl Winit {
         }
 
         // Hand them over to winit.
-        self.backend.bind().unwrap();
-        let age = self.backend.buffer_age().unwrap();
-        let res = self
-            .damage_tracker
-            .render_output(self.backend.renderer(), age, &elements, [0.; 4])
-            .unwrap();
+        let res = {
+            let (renderer, mut framebuffer) = self.backend.bind().unwrap();
+            // FIXME: currently impossible to call due to a mutable borrow.
+            //
+            // let age = self.backend.buffer_age().unwrap();
+            let age = 0;
+            self.damage_tracker
+                .render_output(renderer, &mut framebuffer, age, &elements, [0.; 4])
+                .unwrap()
+        };
 
         niri.update_primary_scanout_output(output, &res.states);
 
@@ -208,11 +342,9 @@ impl Winit {
             self.backend.submit(Some(damage)).unwrap();
 
             let mut presentation_feedbacks = niri.take_presentation_feedbacks(output, &res.states);
-            let mode = output.current_mode().unwrap();
-            let refresh = Duration::from_secs_f64(1_000f64 / mode.refresh as f64);
             presentation_feedbacks.presented::<_, smithay::utils::Monotonic>(
                 get_monotonic_time(),
-                refresh,
+                Refresh::Unknown,
                 0,
                 wp_presentation_feedback::Kind::empty(),
             );

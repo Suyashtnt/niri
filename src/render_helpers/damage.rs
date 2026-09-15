@@ -1,7 +1,8 @@
 use smithay::backend::renderer::element::{Element, Id, RenderElement};
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::Renderer;
-use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
+use smithay::utils::user_data::UserDataMap;
+use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Size};
 
 #[derive(Debug, Clone)]
 pub struct ExtraDamage {
@@ -19,22 +20,14 @@ impl ExtraDamage {
         }
     }
 
-    pub fn set_size(&mut self, size: Size<f64, Logical>) {
-        if self.geometry.size == size {
-            return;
-        }
-
-        self.geometry.size = size;
-        self.commit.increment();
-    }
-
     pub fn damage_all(&mut self) {
         self.commit.increment();
     }
 
-    pub fn with_location(mut self, location: Point<f64, Logical>) -> Self {
-        self.geometry.loc = location;
-        self
+    pub fn render(&self, geometry: Rectangle<f64, Logical>) -> Self {
+        let mut this = self.clone();
+        this.geometry = geometry;
+        this
     }
 }
 
@@ -54,7 +47,7 @@ impl Element for ExtraDamage {
     }
 
     fn src(&self) -> Rectangle<f64, Buffer> {
-        Rectangle::from_loc_and_size((0., 0.), (1., 1.))
+        Rectangle::from_size(Size::from((1., 1.)))
     }
 
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
@@ -65,11 +58,12 @@ impl Element for ExtraDamage {
 impl<R: Renderer> RenderElement<R> for ExtraDamage {
     fn draw(
         &self,
-        _frame: &mut <R as Renderer>::Frame<'_>,
+        _frame: &mut R::Frame<'_, '_>,
         _src: Rectangle<f64, Buffer>,
         _dst: Rectangle<i32, Physical>,
         _damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
+        _cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
         Ok(())
     }

@@ -1,14 +1,17 @@
+use niri_config::PresetSize;
 use smithay::desktop::Window;
 use smithay::output::Output;
 use smithay::wayland::shell::xdg::ToplevelSurface;
+use smithay::wayland::xdg_activation::XdgActivationTokenData;
 
 use super::ResolvedWindowRules;
-use crate::layout::workspace::ColumnWidth;
 
 #[derive(Debug)]
 pub struct Unmapped {
     pub window: Window,
     pub state: InitialConfigureState,
+    /// Activation token, if one was used on this unmapped window.
+    pub activation_token_data: Option<XdgActivationTokenData>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -18,6 +21,9 @@ pub enum InitialConfigureState {
     NotConfigured {
         /// Whether the window requested to be fullscreened, and the requested output, if any.
         wants_fullscreen: Option<Option<Output>>,
+
+        /// Whether the window requested to be maximized.
+        wants_maximized: bool,
     },
     /// The window has been configured.
     Configured {
@@ -27,10 +33,25 @@ pub enum InitialConfigureState {
         /// affect anything before that.
         rules: ResolvedWindowRules,
 
-        /// Resolved default width for this window.
+        /// Resolved scrolling default width for this window.
         ///
         /// `None` means that the window will pick its own width.
-        width: Option<ColumnWidth>,
+        width: Option<PresetSize>,
+
+        /// Resolved scrolling default height for this window.
+        ///
+        /// `None` means that the window will pick its own height.
+        height: Option<PresetSize>,
+
+        /// Resolved floating default width for this window.
+        ///
+        /// `None` means that the window will pick its own width.
+        floating_width: Option<PresetSize>,
+
+        /// Resolved floating default height for this window.
+        ///
+        /// `None` means that the window will pick its own height.
+        floating_height: Option<PresetSize>,
 
         /// Whether the window should open full-width.
         is_full_width: bool,
@@ -46,6 +67,13 @@ pub enum InitialConfigureState {
 
         /// Workspace to open this window on.
         workspace_name: Option<String>,
+
+        /// Whether the window should be maximized.
+        ///
+        /// This corresponds to the window having the Maximized toplevel state. However, if the
+        /// window is also pending fullscreen, then it has the Fullscreen toplevel state, so we
+        /// need to store pending maximized elsewhere, hence this field.
+        is_pending_maximized: bool,
     },
 }
 
@@ -56,7 +84,9 @@ impl Unmapped {
             window,
             state: InitialConfigureState::NotConfigured {
                 wants_fullscreen: None,
+                wants_maximized: false,
             },
+            activation_token_data: None,
         }
     }
 

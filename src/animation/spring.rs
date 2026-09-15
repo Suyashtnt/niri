@@ -54,6 +54,10 @@ impl Spring {
             return Duration::MAX;
         }
 
+        if (self.to - self.from).abs() <= f64::EPSILON {
+            return Duration::ZERO;
+        }
+
         let omega0 = (self.params.stiffness / self.params.mass).sqrt();
 
         // As first ansatz for the overdamped solution,
@@ -90,6 +94,12 @@ impl Spring {
 
             x1 = (self.to - y0 + m * x0) / m;
             y1 = self.oscillate(x1);
+
+            // Overdamped springs have some numerical stability issues...
+            if !y1.is_finite() {
+                return Duration::from_secs_f64(x0);
+            }
+
             i += 1;
         }
 
@@ -164,5 +174,36 @@ impl Spring {
                 + envelope
                     * (x0 * (omega2 * t).cosh() + ((beta * x0 + v0) / omega2) * (omega2 * t).sinh())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overdamped_spring_equal_from_to_nan() {
+        let spring = Spring {
+            from: 0.,
+            to: 0.,
+            initial_velocity: 0.,
+            params: SpringParams::new(1.15, 850., 0.0001),
+        };
+        let _ = spring.duration();
+        let _ = spring.clamped_duration();
+        let _ = spring.value_at(Duration::ZERO);
+    }
+
+    #[test]
+    fn overdamped_spring_duration_panic() {
+        let spring = Spring {
+            from: 0.,
+            to: 1.,
+            initial_velocity: 0.,
+            params: SpringParams::new(6., 1200., 0.0001),
+        };
+        let _ = spring.duration();
+        let _ = spring.clamped_duration();
+        let _ = spring.value_at(Duration::ZERO);
     }
 }

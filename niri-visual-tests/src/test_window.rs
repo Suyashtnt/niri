@@ -3,13 +3,16 @@ use std::cmp::{max, min};
 use std::rc::Rc;
 
 use niri::layout::{
-    InteractiveResizeData, LayoutElement, LayoutElementRenderElement, LayoutElementRenderSnapshot,
+    ConfigureIntent, InteractiveResizeData, LayoutElement, LayoutElementRenderElement,
+    LayoutElementRenderSnapshot, SizingMode,
 };
+use niri::render_helpers::offscreen::OffscreenData;
 use niri::render_helpers::renderer::NiriRenderer;
 use niri::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use niri::render_helpers::{RenderTarget, SplitElements};
+use niri::render_helpers::RenderCtx;
+use niri::utils::transaction::Transaction;
 use niri::window::ResolvedWindowRules;
-use smithay::backend::renderer::element::{Id, Kind};
+use smithay::backend::renderer::element::Kind;
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Scale, Serial, Size, Transform};
@@ -21,7 +24,7 @@ struct TestWindowInner {
     min_size: Size<i32, Logical>,
     max_size: Size<i32, Logical>,
     buffer: SolidColorBuffer,
-    pending_fullscreen: bool,
+    pending_sizing_mode: SizingMode,
     csd_shadow_width: i32,
     csd_shadow_buffer: SolidColorBuffer,
 }
@@ -30,6 +33,7 @@ struct TestWindowInner {
 pub struct TestWindow {
     id: usize,
     inner: Rc<RefCell<TestWindowInner>>,
+    rules: ResolvedWindowRules,
 }
 
 impl TestWindow {
@@ -47,10 +51,11 @@ impl TestWindow {
                 min_size,
                 max_size,
                 buffer,
-                pending_fullscreen: false,
+                pending_sizing_mode: SizingMode::Normal,
                 csd_shadow_width: 0,
                 csd_shadow_buffer: SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.3]),
             })),
+            rules: ResolvedWindowRules::default(),
         }
     }
 
@@ -85,7 +90,7 @@ impl TestWindow {
 
         let mut new_size = inner.size;
 
-        if let Some(size) = inner.requested_size.take() {
+        if let Some(size) = inner.requested_size {
             assert!(size.w >= 0);
             assert!(size.h >= 0);
 
@@ -144,45 +149,40 @@ impl LayoutElement for TestWindow {
         false
     }
 
-    fn render<R: NiriRenderer>(
+    fn render_normal<R: NiriRenderer>(
         &self,
-        _renderer: &mut R,
+        _ctx: RenderCtx<R>,
         location: Point<f64, Logical>,
         _scale: Scale<f64>,
         alpha: f32,
-        _target: RenderTarget,
-    ) -> SplitElements<LayoutElementRenderElement<R>> {
+        push: &mut dyn FnMut(LayoutElementRenderElement<R>),
+    ) {
         let inner = self.inner.borrow();
 
-        SplitElements {
-            normal: vec![
-                SolidColorRenderElement::from_buffer(
-                    &inner.buffer,
-                    location,
-                    alpha,
-                    Kind::Unspecified,
-                )
+        push(
+            SolidColorRenderElement::from_buffer(&inner.buffer, location, alpha, Kind::Unspecified)
                 .into(),
-                SolidColorRenderElement::from_buffer(
-                    &inner.csd_shadow_buffer,
-                    location
-                        - Point::from((inner.csd_shadow_width, inner.csd_shadow_width)).to_f64(),
-                    alpha,
-                    Kind::Unspecified,
-                )
-                .into(),
-            ],
-            popups: vec![],
-        }
+        );
+        push(
+            SolidColorRenderElement::from_buffer(
+                &inner.csd_shadow_buffer,
+                location - Point::from((inner.csd_shadow_width, inner.csd_shadow_width)).to_f64(),
+                alpha,
+                Kind::Unspecified,
+            )
+            .into(),
+        );
     }
 
-    fn request_size(&mut self, size: Size<i32, Logical>, _animate: bool) {
+    fn request_size(
+        &mut self,
+        size: Size<i32, Logical>,
+        mode: SizingMode,
+        _animate: bool,
+        _transaction: Option<Transaction>,
+    ) {
         self.inner.borrow_mut().requested_size = Some(size);
-        self.inner.borrow_mut().pending_fullscreen = false;
-    }
-
-    fn request_fullscreen(&self, _size: Size<i32, Logical>) {
-        self.inner.borrow_mut().pending_fullscreen = true;
+        self.inner.borrow_mut().pending_sizing_mode = mode;
     }
 
     fn min_size(&self) -> Size<i32, Logical> {
@@ -207,33 +207,46 @@ impl LayoutElement for TestWindow {
 
     fn output_leave(&self, _output: &Output) {}
 
-    fn set_offscreen_element_id(&self, _id: Option<Id>) {}
+    fn set_offscreen_data(&self, _data: Option<OffscreenData>) {}
 
     fn set_activated(&mut self, _active: bool) {}
 
     fn set_active_in_column(&mut self, _active: bool) {}
 
+    fn set_floating(&mut self, _floating: bool) {}
+
     fn set_bounds(&self, _bounds: Size<i32, Logical>) {}
 
-    fn send_pending_configure(&mut self) {}
-
-    fn is_fullscreen(&self) -> bool {
+    fn is_ignoring_opacity_window_rule(&self) -> bool {
         false
     }
 
-    fn is_pending_fullscreen(&self) -> bool {
-        self.inner.borrow().pending_fullscreen
+    fn configure_intent(&self) -> ConfigureIntent {
+        ConfigureIntent::CanSend
+    }
+
+    fn send_pending_configure(&mut self) {}
+
+    fn pending_sizing_mode(&self) -> SizingMode {
+        self.inner.borrow().pending_sizing_mode
+    }
+
+    fn sizing_mode(&self) -> SizingMode {
+        SizingMode::Normal
+    }
+
+    fn requested_size(&self) -> Option<Size<i32, Logical>> {
+        self.inner.borrow().requested_size
+    }
+
+    fn is_child_of(&self, _parent: &Self) -> bool {
+        false
     }
 
     fn refresh(&self) {}
 
     fn rules(&self) -> &ResolvedWindowRules {
-        static EMPTY: ResolvedWindowRules = ResolvedWindowRules::empty();
-        &EMPTY
-    }
-
-    fn animation_snapshot(&self) -> Option<&LayoutElementRenderSnapshot> {
-        None
+        &self.rules
     }
 
     fn take_animation_snapshot(&mut self) -> Option<LayoutElementRenderSnapshot> {
@@ -244,9 +257,13 @@ impl LayoutElement for TestWindow {
 
     fn cancel_interactive_resize(&mut self) {}
 
-    fn update_interactive_resize(&mut self, _serial: Serial) {}
+    fn on_commit(&mut self, _serial: Serial) {}
 
     fn interactive_resize_data(&self) -> Option<InteractiveResizeData> {
         None
+    }
+
+    fn is_urgent(&self) -> bool {
+        false
     }
 }

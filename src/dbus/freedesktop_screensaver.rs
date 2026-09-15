@@ -1,30 +1,31 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Context;
 use futures_util::StreamExt;
-use zbus::fdo::{self, RequestNameFlags};
+use zbus::message::Header;
 use zbus::names::{OwnedUniqueName, UniqueName};
 use zbus::zvariant::NoneValue;
-use zbus::{dbus_interface, MessageHeader, Task};
+use zbus::{fdo, interface, Task};
 
-use super::Start;
+use super::{request_name, Start};
 
+#[derive(Clone)]
 pub struct ScreenSaver {
     is_inhibited: Arc<AtomicBool>,
     is_broken: Arc<AtomicBool>,
     inhibitors: Arc<Mutex<HashMap<u32, OwnedUniqueName>>>,
-    counter: u32,
+    counter: Arc<AtomicU32>,
     monitor_task: Arc<OnceLock<Task<()>>>,
 }
 
-#[dbus_interface(name = "org.freedesktop.ScreenSaver")]
+#[interface(name = "org.freedesktop.ScreenSaver")]
 impl ScreenSaver {
     async fn inhibit(
         &mut self,
-        #[zbus(header)] hdr: MessageHeader<'_>,
+        #[zbus(header)] hdr: Header<'_>,
         application_name: &str,
         reason_for_inhibit: &str,
     ) -> fdo::Result<u32> {
@@ -33,7 +34,7 @@ impl ScreenSaver {
             hdr.sender()
         );
 
-        let Ok(Some(name)) = hdr.sender() else {
+        let Some(name) = hdr.sender() else {
             return Err(fdo::Error::Failed(String::from("no sender")));
         };
         let name = OwnedUniqueName::from(name.to_owned());
@@ -42,16 +43,16 @@ impl ScreenSaver {
 
         let mut cookie = None;
         for _ in 0..3 {
-            // Start from 1 because some clients don't like 0.
-            self.counter = self.counter.wrapping_add(1);
-            if self.counter == 0 {
-                self.counter += 1;
+            let mut inhibitor_key = self.counter.fetch_add(1, Ordering::SeqCst);
+            if inhibitor_key == 0 {
+                // Some clients don't like 0, add one more.
+                inhibitor_key = self.counter.fetch_add(1, Ordering::SeqCst);
             }
 
-            if let Entry::Vacant(entry) = inhibitors.entry(self.counter) {
+            if let Entry::Vacant(entry) = inhibitors.entry(inhibitor_key) {
                 entry.insert(name);
                 self.is_inhibited.store(true, Ordering::SeqCst);
-                cookie = Some(self.counter);
+                let _ = cookie.insert(inhibitor_key);
                 break;
             }
         }
@@ -82,7 +83,8 @@ impl ScreenSaver {
             is_inhibited,
             is_broken: Arc::new(AtomicBool::new(false)),
             inhibitors: Arc::new(Mutex::new(HashMap::new())),
-            counter: 0,
+            // Start from 1 because some clients don't like 0.
+            counter: Arc::new(AtomicU32::new(1)),
             monitor_task: Arc::new(OnceLock::new()),
         }
     }
@@ -126,20 +128,23 @@ async fn monitor_disappeared_clients(
 }
 
 impl Start for ScreenSaver {
-    fn start(self) -> anyhow::Result<zbus::blocking::Connection> {
+    fn start(self, monitor: bool) -> anyhow::Result<zbus::blocking::Connection> {
         let is_inhibited = self.is_inhibited.clone();
         let is_broken = self.is_broken.clone();
         let inhibitors = self.inhibitors.clone();
         let monitor_task = self.monitor_task.clone();
 
         let conn = zbus::blocking::Connection::session()?;
-        let flags = RequestNameFlags::AllowReplacement
-            | RequestNameFlags::ReplaceExisting
-            | RequestNameFlags::DoNotQueue;
+        let org_fd_ss_registered = conn
+            .object_server()
+            .at("/org/freedesktop/ScreenSaver", self.clone())?;
+        let ss_registered = conn.object_server().at("/ScreenSaver", self)?;
 
-        conn.object_server()
-            .at("/org/freedesktop/ScreenSaver", self)?;
-        conn.request_name_with_flags("org.freedesktop.ScreenSaver", flags)?;
+        if !org_fd_ss_registered && !ss_registered {
+            anyhow::bail!("failed to register any org.freedesktop.ScreenSaver interface")
+        }
+
+        request_name(&conn, "org.freedesktop.ScreenSaver", monitor)?;
 
         let async_conn = conn.inner();
         let future = {
